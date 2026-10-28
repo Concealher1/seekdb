@@ -6831,7 +6831,25 @@ int ObLogPlan::allocate_select_into_as_top(ObLogicalOperator *&old_top)
       select_into->set_cs_type(into_item->cs_type_);
       select_into->set_external_properties(into_item->external_properties_);
       select_into->set_child(ObLogicalOperator::first_child, old_top);
-      // compute property
+      select_into->set_with_header(into_item->with_header_);
+      select_into->set_null_str(into_item->null_str_);
+      {
+        ObSEArray<ObString, 8> header_names;
+        const ObIArray<SelectItem> &select_items = stmt->get_select_items();
+        for (int64_t i = 0; OB_SUCC(ret) && i < select_items.count(); ++i) {
+          const SelectItem &select_item = select_items.at(i);
+          if (select_item.is_hidden_rowid_) {
+            continue;
+          }
+          ObString header_name = select_item.alias_name_.empty()
+                                     ? select_item.expr_name_
+                                     : select_item.alias_name_;
+          if (OB_FAIL(header_names.push_back(header_name))) {
+          }
+        }
+        if (OB_SUCC(ret) && OB_FAIL(select_into->set_header_names(header_names))) {
+        }
+      }
       if (OB_FAIL(select_into->compute_property())) {
       } else {
         old_top = select_into;

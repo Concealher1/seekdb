@@ -21,6 +21,8 @@
 
 #include "ob_csv_reader.h"
 #include "ob_file_sql_type.h"
+#include "ob_json_reader.h"
+#include "ob_parquet_reader.h"
 
 using namespace oceanbase::storage;
 
@@ -137,6 +139,108 @@ bool read_all(ObCSVReader &reader, const size_t batch_size, std::vector<Row> &ro
     }
   }
   return true;
+}
+
+bool read_all(ObJsonReader &reader, const size_t batch_size, std::vector<Row> &rows)
+{
+  rows.clear();
+  for (;;) {
+    std::vector<Row> batch;
+    if (reader.next_batch(batch_size, batch) != 0) {
+      return false;
+    }
+    if (batch.empty()) {
+      break;
+    }
+    if (batch.size() > batch_size) {
+      return false;
+    }
+    for (size_t i = 0; i < batch.size(); ++i) {
+      rows.push_back(std::move(batch[i]));
+    }
+  }
+  return true;
+}
+
+bool read_all(ObParquetReader &reader, const size_t batch_size, std::vector<Row> &rows)
+{
+  rows.clear();
+  for (;;) {
+    std::vector<Row> batch;
+    if (reader.next_batch(batch_size, batch) != 0) {
+      return false;
+    }
+    if (batch.empty()) {
+      break;
+    }
+    if (batch.size() > batch_size) {
+      return false;
+    }
+    for (size_t i = 0; i < batch.size(); ++i) {
+      rows.push_back(std::move(batch[i]));
+    }
+  }
+  return true;
+}
+
+std::string read_binary_file(const std::string &path)
+{
+  std::ifstream in(path.c_str(), std::ios::binary);
+  if (!in.is_open()) {
+    return std::string();
+  }
+  std::ostringstream buffer;
+  buffer << in.rdbuf();
+  return buffer.str();
+}
+
+std::string decode_base64(const std::string &input)
+{
+  static const char alphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  int values[256];
+  for (int i = 0; i < 256; ++i) {
+    values[i] = -1;
+  }
+  for (int i = 0; i < 64; ++i) {
+    values[static_cast<unsigned char>(alphabet[i])] = i;
+  }
+  std::string output;
+  uint32_t accumulator = 0;
+  int bits = 0;
+  for (size_t i = 0; i < input.size(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(input[i]);
+    if (c == '=') {
+      break;
+    }
+    if (values[c] < 0) {
+      continue;
+    }
+    accumulator = (accumulator << 6) | static_cast<uint32_t>(values[c]);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      output.push_back(static_cast<char>((accumulator >> bits) & 0xFF));
+    }
+  }
+  return output;
+}
+
+std::string parquet_fixture_path(const std::string &basic_path)
+{
+  const std::string directory = basic_path.substr(0, basic_path.find_last_of('/') + 1);
+  const std::string plain = directory + "simple.parquet";
+  std::ifstream probe(plain.c_str(), std::ios::binary);
+  if (probe.is_open()) {
+    return plain;
+  }
+  const std::string encoded = read_binary_file(directory + "simple.parquet.b64");
+  const std::string decoded = decode_base64(encoded);
+  const std::string output = "/tmp/ob_file_sql_m4_simple.parquet";
+  std::ofstream out(output.c_str(), std::ios::binary | std::ios::trunc);
+  out.write(decoded.data(), static_cast<std::streamsize>(decoded.size()));
+  out.close();
+  return output;
 }
 
 std::string write_temp(const std::string &name, const std::string &content)
@@ -667,6 +771,301 @@ void test_large_field()
   remove_temp(path);
 }
 
+
+void test_json_basic_schema(const std::string &path)
+{
+  GroupGuard guard("basic.jsonl union schema and nullability");
+
+  ObJsonReader reader;
+  check_equal(reader.open(path), 0, "open basic.jsonl");
+  if (!reader.is_open()) {
+    return;
+  }
+  check_equal(reader.infer_schema(), 0, "infer_schema basic.jsonl");
+  check_equal(reader.scanned_row_count(), static_cast<int64_t>(3),
+              "json infer_schema scans the whole file");
+
+  const std::vector<Column> &columns = reader.columns();
+  print_schema(columns);
+  check_schema(columns,
+               {{"id", ObFileSqlType::BIGINT, false},
+                {"name", ObFileSqlType::VARCHAR, false},
+                {"score", ObFileSqlType::DOUBLE, true},
+                {"active", ObFileSqlType::BOOLEAN, false},
+                {"day", ObFileSqlType::DATE, true},
+                {"note", ObFileSqlType::VARCHAR, true}},
+               "basic.jsonl");
+  reader.close();
+}
+
+void test_json_basic_rows(const std::string &path)
+{
+  GroupGuard guard("basic.jsonl row decoding with missing keys");
+
+  ObJsonReader reader;
+  check_equal(reader.open(path), 0, "open basic.jsonl");
+  if (!reader.is_open()) {
+    return;
+  }
+  check_equal(reader.infer_schema(), 0, "infer_schema basic.jsonl");
+
+  std::vector<Row> rows;
+  check_true(read_all(reader, 2, rows), "read basic.jsonl in batches of 2");
+  check_equal(rows.size(), static_cast<size_t>(3), "basic.jsonl record count");
+  if (rows.size() != 3) {
+    return;
+  }
+  for (size_t i = 0; i < rows.size(); ++i) {
+    check_equal(rows[i].size(), static_cast<size_t>(6),
+                "json row " + std::to_string(i + 1) + " field count");
+  }
+
+  check_equal(rows[0][0], std::string("1"), "json row 1 id");
+  check_equal(rows[0][1], std::string("Alice"), "json row 1 name");
+  check_equal(rows[0][2], std::string("98.5"), "json row 1 score");
+  check_equal(rows[0][3], std::string("true"), "json row 1 active");
+  check_true(rows[0].is_null(4), "json row 1 day is NULL");
+  check_true(rows[0].is_null(5), "json row 1 note is NULL");
+
+  check_equal(rows[1][0], std::string("2"), "json row 2 id");
+  check_equal(rows[1][1], std::string("Bob"), "json row 2 name");
+  check_true(rows[1].is_null(2), "json row 2 score is NULL");
+  check_equal(rows[1][3], std::string("false"), "json row 2 active");
+  check_equal(rows[1][4], std::string("2026-08-02"), "json row 2 day");
+  check_true(rows[1].is_null(5), "json row 2 note is NULL");
+
+  check_equal(rows[2][0], std::string("3"), "json row 3 id");
+  check_equal(rows[2][1], std::string("Chen"), "json row 3 name");
+  check_equal(rows[2][2], std::string("90"), "json row 3 score");
+  check_equal(rows[2][3], std::string("true"), "json row 3 active");
+  check_true(rows[2].is_null(4), "json row 3 day is NULL");
+  check_equal(rows[2][5], std::string("ok"), "json row 3 note");
+
+  // EOF / rewind behaviour.
+  std::vector<Row> extra;
+  check_equal(reader.next_batch(1, extra), 0, "json next_batch at EOF");
+  check_true(extra.empty(), "json next_batch at EOF is empty");
+  check_true(reader.eof(), "json eof flag");
+  check_equal(reader.rewind(), 0, "json rewind");
+  check_true(!reader.eof(), "json rewind clears eof");
+  check_equal(reader.next_batch(1, extra), 0, "json next_batch after rewind");
+  check_equal(extra.size(), static_cast<size_t>(1), "json one row after rewind");
+  if (!extra.empty()) {
+    check_equal(extra[0][0], std::string("1"), "json rewind restarts at record 1");
+  }
+  reader.close();
+}
+
+void test_json_nested_rejected()
+{
+  GroupGuard guard("nested JSON object / array are rejected with a clear error");
+
+  const std::string nested_path = write_temp(
+      "nested.jsonl", "{\"a\":1,\"nested\":{\"b\":2}}\n");
+  ObJsonReader nested_reader;
+  check_equal(nested_reader.open(nested_path), 0, "open nested JSONL");
+  if (nested_reader.is_open()) {
+    check_equal(nested_reader.infer_schema(), -1, "nested JSON object is rejected");
+    check_true(nested_reader.last_error() == ObJsonReadError::NESTED,
+               "nested JSON object sets the NESTED error");
+    check_true(nested_reader.last_error_message().find("nested JSON object") !=
+                   std::string::npos,
+               "nested JSON object error message mentions the object");
+  }
+  nested_reader.close();
+  remove_temp(nested_path);
+
+  const std::string array_path = write_temp(
+      "array.jsonl", "{\"a\":[1,2,3]}\n");
+  ObJsonReader array_reader;
+  check_equal(array_reader.open(array_path), 0, "open array JSONL");
+  if (array_reader.is_open()) {
+    check_equal(array_reader.infer_schema(), -1, "JSON array value is rejected");
+    check_true(array_reader.last_error() == ObJsonReadError::NESTED,
+               "JSON array sets the NESTED error");
+  }
+  array_reader.close();
+  remove_temp(array_path);
+}
+
+void test_json_widening_and_nullability()
+{
+  GroupGuard guard("JSON widening and missing-key nullability");
+
+  const std::string double_path = write_temp(
+      "json_double.jsonl", "{\"n\":1}\n{\"n\":2.5}\n");
+  ObJsonReader double_reader;
+  check_equal(double_reader.open(double_path), 0, "open JSON widening file");
+  if (double_reader.is_open()) {
+    check_equal(double_reader.infer_schema(), 0, "infer JSON widening schema");
+    check_schema(double_reader.columns(), {{"n", ObFileSqlType::DOUBLE, false}},
+                 "json widening");
+  }
+  double_reader.close();
+  remove_temp(double_path);
+
+  const std::string varchar_path = write_temp(
+      "json_varchar.jsonl", "{\"n\":1}\n{\"n\":\"x\"}\n");
+  ObJsonReader varchar_reader;
+  check_equal(varchar_reader.open(varchar_path), 0, "open JSON conflict file");
+  if (varchar_reader.is_open()) {
+    check_equal(varchar_reader.infer_schema(), 0, "infer JSON conflict schema");
+    check_schema(varchar_reader.columns(), {{"n", ObFileSqlType::VARCHAR, false}},
+                 "json conflict");
+  }
+  varchar_reader.close();
+  remove_temp(varchar_path);
+
+  const std::string nullable_path = write_temp(
+      "json_nullable.jsonl", "{\"a\":1,\"b\":2}\n{\"a\":3}\n");
+  ObJsonReader nullable_reader;
+  check_equal(nullable_reader.open(nullable_path), 0, "open JSON nullable file");
+  if (nullable_reader.is_open()) {
+    check_equal(nullable_reader.infer_schema(), 0, "infer JSON nullable schema");
+    check_schema(nullable_reader.columns(),
+                 {{"a", ObFileSqlType::BIGINT, false},
+                  {"b", ObFileSqlType::BIGINT, true}},
+                 "json nullable");
+    std::vector<Row> rows;
+    check_true(read_all(nullable_reader, 10, rows), "read JSON nullable rows");
+    check_equal(rows.size(), static_cast<size_t>(2), "json nullable row count");
+    if (rows.size() == 2) {
+      check_equal(rows[0][1], std::string("2"), "json present key value");
+      check_true(rows[1].is_null(1), "json missing key becomes NULL");
+    }
+  }
+  nullable_reader.close();
+  remove_temp(nullable_path);
+
+  const std::string null_path = write_temp(
+      "json_null.jsonl", "{\"a\":null,\"b\":1}\n{\"b\":2}\n");
+  ObJsonReader null_reader;
+  check_equal(null_reader.open(null_path), 0, "open JSON null file");
+  if (null_reader.is_open()) {
+    check_equal(null_reader.infer_schema(), 0, "infer JSON null schema");
+    check_schema(null_reader.columns(),
+                 {{"a", ObFileSqlType::VARCHAR, true},
+                  {"b", ObFileSqlType::BIGINT, false}},
+                 "json null");
+  }
+  null_reader.close();
+  remove_temp(null_path);
+}
+
+void test_json_escapes_crlf_and_blank_lines()
+{
+  GroupGuard guard("JSON escapes, CRLF and blank lines");
+
+  const std::string content =
+      "{\"s\":\"a\\\"b\",\"n\":1}\r\n"
+      "\r\n"
+      "{\"s\":\"line\\nnext\",\"n\":2}\r\n";
+  const std::string path = write_temp("json_escapes.jsonl", content);
+
+  ObJsonReader reader;
+  check_equal(reader.open(path), 0, "open escaped JSONL");
+  if (reader.is_open()) {
+    check_equal(reader.infer_schema(), 0, "infer escaped JSONL schema");
+    check_equal(reader.scanned_row_count(), static_cast<int64_t>(2),
+                "blank lines are not records");
+    check_schema(reader.columns(),
+                 {{"s", ObFileSqlType::VARCHAR, false},
+                  {"n", ObFileSqlType::BIGINT, false}},
+                 "json escapes");
+
+    std::vector<Row> rows;
+    check_true(read_all(reader, 10, rows), "read escaped JSONL");
+    check_equal(rows.size(), static_cast<size_t>(2), "escaped JSONL row count");
+    if (rows.size() == 2) {
+      check_equal(rows[0][0], std::string("a\"b"), "escaped quote");
+      check_equal(rows[1][0], std::string("line\nnext"), "escaped newline");
+      check_true(rows[1][0].find('\r') == std::string::npos,
+                 "CRLF does not leak into a JSON string");
+    }
+  }
+  reader.close();
+  remove_temp(path);
+}
+
+
+void test_parquet_basic(const std::string &path)
+{
+  GroupGuard guard("simple.parquet decoding (7 rows, values 0..6)");
+
+  ObParquetReader reader;
+  check_equal(reader.open(path), 0, "open simple.parquet");
+  if (!reader.is_open()) {
+    return;
+  }
+  check_equal(reader.infer_schema(), 0, "infer_schema simple.parquet");
+  check_equal(reader.scanned_row_count(), static_cast<int64_t>(7),
+              "parquet footer row count");
+  check_schema(reader.columns(), {{"c1", ObFileSqlType::BIGINT, true}},
+               "simple.parquet");
+
+  std::vector<Row> rows;
+  check_true(read_all(reader, 3, rows), "read simple.parquet in batches of 3");
+  check_equal(rows.size(), static_cast<size_t>(7), "simple.parquet row count");
+  int64_t sum = 0;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    int64_t value = -1;
+    check_true(rows[i].size() == 1, "parquet row has one field");
+    check_true(!rows[i].is_null(0), "parquet value is not NULL");
+    if (!rows[i].is_null(0) && ob_file_sql_parse_bigint(rows[i][0], value)) {
+      check_equal(value, static_cast<int64_t>(i), "parquet value equals its row index");
+      sum += value;
+    } else {
+      ++g_failures;
+    }
+  }
+  check_equal(sum, static_cast<int64_t>(21), "parquet values sum to 21");
+
+  // Rewind / EOF.
+  std::vector<Row> extra;
+  check_equal(reader.next_batch(1, extra), 0, "parquet next_batch at EOF");
+  check_true(extra.empty(), "parquet next_batch at EOF is empty");
+  check_true(reader.eof(), "parquet eof flag");
+  check_equal(reader.rewind(), 0, "parquet rewind");
+  check_true(!reader.eof(), "parquet rewind clears eof");
+  check_equal(reader.next_batch(1, extra), 0, "parquet next_batch after rewind");
+  check_equal(extra.size(), static_cast<size_t>(1), "parquet one row after rewind");
+  if (!extra.empty()) {
+    check_equal(extra[0][0], std::string("0"), "parquet rewind restarts at row 0");
+  }
+  reader.close();
+}
+
+void test_parquet_projection(const std::string &path)
+{
+  GroupGuard guard("Parquet column projection and unknown column");
+
+  ObParquetOptions options;
+  options.projected_columns.push_back("c1");
+  ObParquetReader reader;
+  check_equal(reader.open(path, options), 0, "open parquet with projection");
+  if (reader.is_open()) {
+    check_equal(reader.infer_schema(), 0, "infer parquet with projection");
+    std::vector<Row> rows;
+    check_true(read_all(reader, 10, rows), "read projected parquet");
+    check_equal(rows.size(), static_cast<size_t>(7), "projected parquet row count");
+    if (!rows.empty()) {
+      check_equal(rows[0][0], std::string("0"), "projected column value");
+    }
+  }
+  reader.close();
+
+  ObParquetOptions bad_options;
+  bad_options.projected_columns.push_back("missing_column");
+  ObParquetReader bad_reader;
+  check_equal(bad_reader.open(path, bad_options), 0, "open parquet with bad projection");
+  if (bad_reader.is_open()) {
+    check_equal(bad_reader.infer_schema(), -1, "unknown projected column is rejected");
+    check_true(bad_reader.last_error() == ObParquetReadError::UNSUPPORTED,
+               "unknown projected column sets UNSUPPORTED");
+  }
+  bad_reader.close();
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -683,8 +1082,19 @@ int main(int argc, char **argv)
   }
   probe.close();
 
-  std::cout << "OceanBase file_sql M2 CSV reader self-test\n";
+  const std::string json_path =
+      argc > 2 ? std::string(argv[2])
+               : basic_path.substr(0, basic_path.find_last_of('/') + 1) + "basic.jsonl";
+  std::ifstream json_probe(json_path.c_str(), std::ios::binary);
+  if (!json_probe.is_open()) {
+    std::cout << "FAIL: cannot open basic.jsonl at " << json_path << "\n";
+    return 2;
+  }
+  json_probe.close();
+
+  std::cout << "OceanBase file_sql CSV/JSON reader self-test\n";
   std::cout << "basic.csv: " << basic_path << "\n";
+  std::cout << "basic.jsonl: " << json_path << "\n";
 
   test_basic_schema(basic_path);
   test_basic_rows(basic_path);
@@ -697,6 +1107,21 @@ int main(int argc, char **argv)
   test_classification_edges();
   test_streaming_large();
   test_large_field();
+  test_json_basic_schema(json_path);
+  test_json_basic_rows(json_path);
+  test_json_nested_rejected();
+  test_json_widening_and_nullability();
+  test_json_escapes_crlf_and_blank_lines();
+
+  const std::string parquet_path = parquet_fixture_path(basic_path);
+  std::ifstream parquet_probe(parquet_path.c_str(), std::ios::binary);
+  if (!parquet_probe.is_open()) {
+    std::cout << "FAIL: cannot open simple.parquet at " << parquet_path << "\n";
+    return 2;
+  }
+  parquet_probe.close();
+  test_parquet_basic(parquet_path);
+  test_parquet_projection(parquet_path);
 
   std::cout << "\n";
   if (g_failures == 0) {

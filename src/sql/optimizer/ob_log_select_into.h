@@ -44,7 +44,10 @@ public:
         escaped_cht_(),
         cs_type_(CS_TYPE_INVALID),
         is_overwrite_(false),
-        external_properties_()
+        external_properties_(),
+        with_header_(false),
+        null_str_(),
+        header_names_()
   {
   }
   virtual ~ObLogSelectInto() {}
@@ -107,6 +110,30 @@ public:
   inline void set_external_properties(const common::ObString &external_properties)
   {
     external_properties_.assign_ptr(external_properties.ptr(), external_properties.length());
+  }
+  inline void set_with_header(bool with_header)
+  {
+    with_header_ = with_header;
+  }
+  inline void set_null_str(const common::ObString &null_str)
+  {
+    null_str_ = null_str;
+  }
+  inline int set_header_names(common::ObIArray<common::ObString> &header_names)
+  {
+    return header_names_.assign(header_names);
+  }
+  inline bool get_with_header() const
+  {
+    return with_header_;
+  }
+  inline const common::ObString &get_null_str() const
+  {
+    return null_str_;
+  }
+  inline const common::ObIArray<common::ObString> &get_header_names() const
+  {
+    return header_names_;
   }
   inline ObItemType get_into_type() const
   {
@@ -188,6 +215,9 @@ private:
   common::ObCollationType cs_type_;
   bool is_overwrite_;
   common::ObString external_properties_;
+  bool with_header_;
+  common::ObString null_str_;
+  common::ObSEArray<common::ObString, 8> header_names_;
 };
 }
 }

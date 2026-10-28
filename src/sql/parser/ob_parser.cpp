@@ -22,9 +22,296 @@
 #include "parse_node.h"
 #include "ob_sql_parser.h"
 #include "sql/pl/parser/ob_pl_parser.h"
+#include <cctype>
+#include <cstring>
+#include <strings.h>
+#include <string>
 using namespace oceanbase::pl;
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
+
+
+namespace
+{
+
+/**
+ * COPY (query) TO 'file' (format csv, header, nullstr 'NULL') is not part of
+ * the MySQL grammar.  Rewrite it into the existing
+ *   SELECT * FROM (query) INTO OUTFILE 'file' FORMAT=(TYPE='csv', ...)
+ * statement, which the resolver/executor already implement.  The extra
+ * PARSE_HEADER / null_if options are interpreted by the outfile
+ * writer as "write a header row" / "render NULL as this string".
+ */
+static bool copy_stmt_space(const char c)
+{
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+bool copy_stmt_keyword_eq(const std::string &text,
+                          const size_t pos,
+                          const char *word,
+                          size_t &end)
+{
+  const size_t length = std::strlen(word);
+  if (pos + length > text.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < length; ++i) {
+    if (std::tolower(static_cast<unsigned char>(text[pos + i])) != word[i]) {
+      return false;
+    }
+  }
+  end = pos + length;
+  if (end < text.size()) {
+    const unsigned char next = static_cast<unsigned char>(text[end]);
+    if (std::isalnum(next) || next == '_') {
+      return false;
+    }
+  }
+  return true;
+}
+
+void copy_stmt_skip_ws(const std::string &text, size_t &pos)
+{
+  while (pos < text.size()) {
+    if (copy_stmt_space(text[pos])) {
+      ++pos;
+    } else if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '*') {
+      const size_t end = text.find("*/", pos + 2);
+      pos = (std::string::npos == end) ? text.size() : end + 2;
+    } else if (pos + 1 < text.size() && text[pos] == '-' && text[pos + 1] == '-') {
+      const size_t end = text.find('\n', pos + 2);
+      pos = (std::string::npos == end) ? text.size() : end + 1;
+    } else if (text[pos] == '#') {
+      const size_t end = text.find('\n', pos + 1);
+      pos = (std::string::npos == end) ? text.size() : end + 1;
+    } else {
+      break;
+    }
+  }
+}
+
+/** Return the index of the ')' matching the '(' at `pos`, or npos. */
+size_t copy_stmt_matching_paren(const std::string &text, const size_t pos)
+{
+  int depth = 0;
+  char quote = 0;
+  bool escaped = false;
+  for (size_t i = pos; i < text.size(); ++i) {
+    const char c = text[i];
+    if (0 != quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == quote) {
+        quote = 0;
+      }
+    } else if (c == '\'' || c == '"' || c == '`') {
+      quote = c;
+    } else if (c == '(') {
+      ++depth;
+    } else if (c == ')') {
+      --depth;
+      if (0 == depth) {
+        return i;
+      }
+    }
+  }
+  return std::string::npos;
+}
+
+std::string copy_stmt_trim(const std::string &value)
+{
+  size_t begin = 0;
+  size_t end = value.size();
+  while (begin < end && std::isspace(static_cast<unsigned char>(value[begin]))) {
+    ++begin;
+  }
+  while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+    --end;
+  }
+  return value.substr(begin, end - begin);
+}
+
+bool copy_stmt_is_literal(const std::string &value)
+{
+  if (value.size() < 2) {
+    return false;
+  }
+  const char first = value[0];
+  return (first == '\'' || first == '"') && value[value.size() - 1] == first;
+}
+
+bool copy_stmt_rewrite(const ObString &stmt, std::string &rewritten)
+{
+  rewritten.clear();
+  if (stmt.empty()) {
+    return false;
+  }
+  const std::string text(stmt.ptr(), static_cast<size_t>(stmt.length()));
+  size_t pos = 0;
+  copy_stmt_skip_ws(text, pos);
+  size_t end = 0;
+  if (!copy_stmt_keyword_eq(text, pos, "copy", end)) {
+    return false;
+  }
+  pos = end;
+  copy_stmt_skip_ws(text, pos);
+  if (pos >= text.size() || text[pos] != '(') {
+    return false;
+  }
+  const size_t close = copy_stmt_matching_paren(text, pos);
+  if (std::string::npos == close) {
+    return false;
+  }
+  const std::string inner = text.substr(pos + 1, close - pos - 1);
+  pos = close + 1;
+  copy_stmt_skip_ws(text, pos);
+  if (!copy_stmt_keyword_eq(text, pos, "to", end)) {
+    return false;
+  }
+  pos = end;
+  copy_stmt_skip_ws(text, pos);
+  if (pos >= text.size() || (text[pos] != '\'' && text[pos] != '"')) {
+    return false;
+  }
+  const char path_quote = text[pos];
+  size_t path_end = pos + 1;
+  bool escaped = false;
+  for (; path_end < text.size(); ++path_end) {
+    const char c = text[path_end];
+    if (escaped) {
+      escaped = false;
+    } else if (c == '\\') {
+      escaped = true;
+    } else if (c == path_quote) {
+      break;
+    }
+  }
+  if (path_end >= text.size()) {
+    return false;
+  }
+  const std::string path = text.substr(pos, path_end - pos + 1);
+  pos = path_end + 1;
+  copy_stmt_skip_ws(text, pos);
+
+  bool header = false;
+  std::string nullstr;
+  std::string delimiter;
+  std::string quote_char;
+  std::string escape_char;
+  if (pos < text.size() && text[pos] == '(') {
+    const size_t options_close = copy_stmt_matching_paren(text, pos);
+    if (std::string::npos == options_close) {
+      return false;
+    }
+    const std::string options = text.substr(pos + 1, options_close - pos - 1);
+    size_t item_begin = 0;
+    char option_quote = 0;
+    bool option_escape = false;
+    for (size_t i = 0; i <= options.size(); ++i) {
+      const char c = (i < options.size()) ? options[i] : ',';
+      if (0 != option_quote) {
+        if (option_escape) {
+          option_escape = false;
+        } else if (c == '\\') {
+          option_escape = true;
+        } else if (c == option_quote) {
+          option_quote = 0;
+        }
+        continue;
+      }
+      if (c == '\'' || c == '"') {
+        option_quote = c;
+      } else if (c == ',') {
+        const std::string item = copy_stmt_trim(options.substr(item_begin, i - item_begin));
+        item_begin = i + 1;
+        if (item.empty()) {
+          continue;
+        }
+        size_t word_end = 0;
+        size_t word_begin = 0;
+        while (word_begin < item.size() &&
+               std::isspace(static_cast<unsigned char>(item[word_begin]))) {
+          ++word_begin;
+        }
+        word_end = word_begin;
+        while (word_end < item.size() &&
+               !std::isspace(static_cast<unsigned char>(item[word_end]))) {
+          ++word_end;
+        }
+        const std::string keyword = item.substr(word_begin, word_end - word_begin);
+        const std::string value = copy_stmt_trim(item.substr(word_end));
+        if (0 == strcasecmp(keyword.c_str(), "header")) {
+          header = true;
+        } else if (0 == strcasecmp(keyword.c_str(), "format")) {
+          std::string format = value;
+          if (copy_stmt_is_literal(format)) {
+            format = format.substr(1, format.size() - 2);
+          }
+          if (0 != strcasecmp(format.c_str(), "csv")) {
+            return false;
+          }
+        } else if (0 == strcasecmp(keyword.c_str(), "nullstr")) {
+          if (!copy_stmt_is_literal(value)) {
+            return false;
+          }
+          nullstr = value;
+        } else if (0 == strcasecmp(keyword.c_str(), "delimiter")) {
+          if (!copy_stmt_is_literal(value)) {
+            return false;
+          }
+          delimiter = value;
+        } else if (0 == strcasecmp(keyword.c_str(), "quote")) {
+          if (!copy_stmt_is_literal(value)) {
+            return false;
+          }
+          quote_char = value;
+        } else if (0 == strcasecmp(keyword.c_str(), "escape")) {
+          if (!copy_stmt_is_literal(value)) {
+            return false;
+          }
+          escape_char = value;
+        } else {
+          return false;
+        }
+      }
+    }
+  }
+
+  rewritten = "select * from (";
+  rewritten += inner;
+  rewritten += ") as __ob_copy_src into outfile ";
+  rewritten += path;
+  rewritten += " format=(type='csv'";
+  if (header) {
+    rewritten += ", parse_header=true";
+  }
+  if (!nullstr.empty()) {
+    rewritten += ", null_if=(";
+    rewritten += nullstr;
+    rewritten += ")";
+  }
+  if (!delimiter.empty()) {
+    rewritten += ", field_delimiter=";
+    rewritten += delimiter;
+  } else {
+    rewritten += ", field_delimiter=','";
+  }
+  if (!quote_char.empty()) {
+    rewritten += ", field_optionally_enclosed_by=";
+    rewritten += quote_char;
+  }
+  if (!escape_char.empty()) {
+    rewritten += ", escape=";
+    rewritten += escape_char;
+  }
+  rewritten += ")";
+  return true;
+}
+
+} // namespace
 
 ObParser::ObParser(common::ObIAllocator &allocator,
                    ObSQLMode mode,
@@ -839,14 +1126,26 @@ int ObParser::parse_sql(const ObString &stmt,
                         const bool no_throw_parser_error)
 {
   int ret = OB_SUCCESS;
+  ObString parsed_stmt = stmt;
+  std::string rewritten_copy;
+  ObIAllocator *parse_allocator = static_cast<ObIAllocator *>(parse_result.malloc_pool_);
+  if (NULL != parse_allocator && copy_stmt_rewrite(stmt, rewritten_copy)) {
+    char *buffer = static_cast<char *>(
+        parse_allocator->alloc(static_cast<int64_t>(rewritten_copy.size()) + 1));
+    if (NULL != buffer) {
+      MEMCPY(buffer, rewritten_copy.data(), rewritten_copy.size());
+      buffer[rewritten_copy.size()] = '\0';
+      parsed_stmt.assign_ptr(buffer, static_cast<int32_t>(rewritten_copy.size()));
+    }
+  }
   ObSQLParser sql_parser(*(ObIAllocator*)(parse_result.malloc_pool_), sql_mode_);
-  ObString stmt_str = stmt;
-  if (OB_FAIL(sql_parser.parse(stmt.ptr(), stmt.length(), parse_result))) {
+  ObString stmt_str = parsed_stmt;
+  if (OB_FAIL(sql_parser.parse(parsed_stmt.ptr(), parsed_stmt.length(), parse_result))) {
     // if is multi_values_parser opt not need retry
     if (!parse_result.is_multi_values_parser_) {
       parse_result.enable_compatible_comment_ = false;
       parse_result.mysql_compatible_comment_ = false;
-      if (OB_FAIL(sql_parser.parse(stmt.ptr(), stmt.length(), parse_result))) {
+      if (OB_FAIL(sql_parser.parse(parsed_stmt.ptr(), parsed_stmt.length(), parse_result))) {
         //do nothing.
       }
     }

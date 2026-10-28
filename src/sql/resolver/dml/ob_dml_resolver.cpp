@@ -44,10 +44,16 @@
 #include "common/timezone/ob_time_convert.h"
 #include "storage/file_sql/ob_csv_reader.h"
 #include "storage/file_sql/ob_file_sql_type.h"
+#include "storage/file_sql/ob_json_reader.h"
+#include "storage/file_sql/ob_parquet_reader.h"
+#include <glob.h>
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
+#include <functional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace oceanbase
 {
@@ -11242,6 +11248,44 @@ int file_sql_build_cell_expr(ObRawExprFactory &expr_factory,
   return ret;
 }
 
+// file_arg_list is built as a left-recursive T_EXPR_LIST by the grammar, so
+// for two or more arguments children_[0] is the previous list node rather than
+// the first argument.  Flatten it into a plain vector in source order.
+int file_sql_flatten_args(const ParseNode *node,
+                          std::vector<const ParseNode *> &args)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (T_EXPR_LIST == node->type_) {
+    if (OB_ISNULL(node->children_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (1 == node->num_child_) {
+      if (OB_FAIL(file_sql_flatten_args(node->children_[0], args))) {
+      }
+    } else if (2 == node->num_child_) {
+      if (OB_FAIL(file_sql_flatten_args(node->children_[0], args))) {
+      } else if (OB_ISNULL(node->children_[1])) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        args.push_back(node->children_[1]);
+      }
+    } else {
+      // Tolerate a flat list node as well.
+      for (int64_t i = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
+        if (OB_ISNULL(node->children_[i])) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          args.push_back(node->children_[i]);
+        }
+      }
+    }
+  } else {
+    args.push_back(node);
+  }
+  return ret;
+}
+
 } // anonymous namespace
 
 int ObDMLResolver::resolve_read_file_item(const ParseNode &parse_tree, TableItem *&table_item)
@@ -11251,12 +11295,20 @@ int ObDMLResolver::resolve_read_file_item(const ParseNode &parse_tree, TableItem
   ObValuesTableDef *values_def = NULL;
   ObFileSqlTableDef *file_def = NULL;
   storage::ObCSVReader reader;
+  storage::ObJsonReader json_reader;
+  storage::ObParquetReader parquet_reader;
   storage::ObCsvOptions options;
+  std::vector<storage::Column> resolved_columns;
+  std::vector<storage::Row> glob_rows;
+  size_t glob_row_pos = 0;
+  std::function<int(std::vector<storage::Row> &)> fetch_rows;
+  std::function<int()> rewind_rows;
   bool enable_file_sql = false;
   ObString path;
   ObCollationType cs_type = CS_TYPE_UTF8MB4_GENERAL_CI;
   const ParseNode *args_node = NULL;
   const ParseNode *alias_node = NULL;
+  std::vector<const ParseNode *> args;
   ObString table_name;
   int32_t function_kind = 0;
   if (OB_UNLIKELY(T_READ_FILE_EXPRESSION != parse_tree.type_ || 2 != parse_tree.num_child_) ||
@@ -11267,6 +11319,9 @@ int ObDMLResolver::resolve_read_file_item(const ParseNode &parse_tree, TableItem
     LOG_WARN("invalid read file expression", K(ret), K(parse_tree.type_), K(parse_tree.num_child_));
   } else if (OB_UNLIKELY(T_EXPR_LIST != args_node->type_ || args_node->num_child_ < 1)) {
     ret = OB_ERR_PARSER_SYNTAX;
+  } else if (OB_FAIL(file_sql_flatten_args(args_node, args))) {
+  } else if (OB_UNLIKELY(args.empty())) {
+    ret = OB_ERR_PARSER_SYNTAX;
   } else if (OB_FAIL(session_info_->get_enable_file_sql(enable_file_sql))) {
   } else if (!enable_file_sql) {
     ret = OB_NOT_SUPPORTED;
@@ -11275,19 +11330,14 @@ int ObDMLResolver::resolve_read_file_item(const ParseNode &parse_tree, TableItem
                          parse_tree.value_ > FILE_SQL_FUNC_READ_GLOB)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FALSE_IT(function_kind = static_cast<int32_t>(parse_tree.value_))) {
-  } else if (FILE_SQL_FUNC_READ_CSV != function_kind) {
-    // Only CSV execution is implemented in this milestone slice; the parser
-    // and the AST already carry the function kind for the other readers.
-    ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "this file table function is not implemented yet");
-  } else if (OB_FAIL(file_sql_get_string_arg(args_node->children_[0], path))) {
-    LOG_WARN("read_csv expects a string literal file path", K(ret));
+  } else if (OB_FAIL(file_sql_get_string_arg(args[0], path))) {
+    LOG_WARN("file table function expects a string literal file path", K(ret));
   } else if (OB_FAIL(session_info_->get_collation_connection(cs_type))) {
   }
 
-  // Named arguments and validation of the rejected syntax.
-  for (int64_t i = 1; OB_SUCC(ret) && i < args_node->num_child_; ++i) {
-    const ParseNode *arg = args_node->children_[i];
+  // Named arguments.  Each function kind accepts its own option set.
+  for (size_t i = 1; OB_SUCC(ret) && i < args.size(); ++i) {
+    const ParseNode *arg = args[i];
     const ParseNode *value_node = NULL;
     const ParseNode *name_node = NULL;
     ObString arg_name;
@@ -11300,91 +11350,241 @@ int ObDMLResolver::resolve_read_file_item(const ParseNode &parse_tree, TableItem
       ret = OB_ERR_PARSE_SQL;
     } else {
       arg_name.assign_ptr(name_node->str_value_, static_cast<int32_t>(name_node->str_len_));
-      LOG_ERROR("read_csv arg probe", K(arg->type_), K(arg->num_child_), K(arg_name),
-                K(name_node->str_len_), K(value_node->type_), K(value_node->num_child_),
-                K(args_node->num_child_));
-      if (0 == arg_name.case_compare("header")) {
-        if (OB_FAIL(file_sql_get_bool_arg(value_node, options.header))) {
-        }
-      } else if (0 == arg_name.case_compare("sample_size")) {
-        int64_t sample_size = 0;
-        if (OB_FAIL(file_sql_get_int_arg(value_node, sample_size))) {
-        } else if (-1 != sample_size) {
-          // Only a full scan is implemented, reject positive sample sizes.
+      if (FILE_SQL_FUNC_READ_GLOB == function_kind) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "glob arguments");
+      } else if (FILE_SQL_FUNC_READ_CSV == function_kind) {
+        if (0 == arg_name.case_compare("header")) {
+          if (OB_FAIL(file_sql_get_bool_arg(value_node, options.header))) {
+          }
+        } else if (0 == arg_name.case_compare("sample_size")) {
+          int64_t sample_size = 0;
+          if (OB_FAIL(file_sql_get_int_arg(value_node, sample_size))) {
+          } else if (-1 != sample_size) {
+            // Only a full scan is implemented, reject positive sample sizes.
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv sample_size other than -1");
+          }
+        } else if (0 == arg_name.case_compare("format")) {
+          ObString format;
+          if (OB_FAIL(file_sql_get_string_arg(value_node, format))) {
+          } else if (0 != format.case_compare("csv")) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv format other than csv");
+          }
+        } else if (0 == arg_name.case_compare("delimiter")) {
+          ObString value;
+          if (OB_FAIL(file_sql_get_string_arg(value_node, value))) {
+          } else if (1 != value.length()) {
+            ret = OB_ERR_PARSER_SYNTAX;
+          } else {
+            options.delimiter = value.ptr()[0];
+          }
+        } else if (0 == arg_name.case_compare("quote")) {
+          ObString value;
+          if (OB_FAIL(file_sql_get_string_arg(value_node, value))) {
+          } else if (1 != value.length()) {
+            ret = OB_ERR_PARSER_SYNTAX;
+          } else {
+            options.quote = value.ptr()[0];
+          }
+        } else if (0 == arg_name.case_compare("escape")) {
+          ObString value;
+          if (OB_FAIL(file_sql_get_string_arg(value_node, value))) {
+          } else if (1 != value.length()) {
+            ret = OB_ERR_PARSER_SYNTAX;
+          } else {
+            options.escape = value.ptr()[0];
+          }
+        } else if (0 == arg_name.case_compare("nullstr")) {
+          ObString value;
+          if (OB_FAIL(file_sql_get_string_arg(value_node, value))) {
+          } else {
+            options.nullstr = std::string(value.ptr(), static_cast<size_t>(value.length()));
+          }
+        } else if (0 == arg_name.case_compare("trim")) {
+          if (OB_FAIL(file_sql_get_bool_arg(value_node, options.trim))) {
+          }
+        } else {
           ret = OB_NOT_SUPPORTED;
-          LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv sample_size other than -1");
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "unsupported read_csv option");
         }
+      } else if (FILE_SQL_FUNC_READ_PARQUET == function_kind) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_parquet arguments");
       } else if (0 == arg_name.case_compare("format")) {
         ObString format;
         if (OB_FAIL(file_sql_get_string_arg(value_node, format))) {
-        } else if (0 != format.case_compare("csv")) {
+        } else if (0 != format.case_compare("newline_delimited")) {
           ret = OB_NOT_SUPPORTED;
-          LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv format other than csv");
-        }
-      } else if (0 == arg_name.case_compare("delimiter")) {
-        ObString value;
-        if (OB_FAIL(file_sql_get_string_arg(value_node, value))) {
-        } else if (1 != value.length()) {
-          ret = OB_ERR_PARSER_SYNTAX;
-        } else {
-          options.delimiter = value.ptr()[0];
-        }
-      } else if (0 == arg_name.case_compare("quote")) {
-        ObString value;
-        if (OB_FAIL(file_sql_get_string_arg(value_node, value))) {
-        } else if (1 != value.length()) {
-          ret = OB_ERR_PARSER_SYNTAX;
-        } else {
-          options.quote = value.ptr()[0];
-        }
-      } else if (0 == arg_name.case_compare("escape")) {
-        ObString value;
-        if (OB_FAIL(file_sql_get_string_arg(value_node, value))) {
-        } else if (1 != value.length()) {
-          ret = OB_ERR_PARSER_SYNTAX;
-        } else {
-          options.escape = value.ptr()[0];
-        }
-      } else if (0 == arg_name.case_compare("nullstr")) {
-        ObString value;
-        if (OB_FAIL(file_sql_get_string_arg(value_node, value))) {
-        } else {
-          options.nullstr = std::string(value.ptr(), static_cast<size_t>(value.length()));
-        }
-      } else if (0 == arg_name.case_compare("trim")) {
-        if (OB_FAIL(file_sql_get_bool_arg(value_node, options.trim))) {
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "JSON format other than newline_delimited");
         }
       } else {
         ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "unsupported read_csv option");
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "unsupported read_json option");
       }
     }
   }
 
-  // secure_file_priv check on the canonical path.
+  // Resolve and read the input.  glob() validates every match against
+  // secure_file_priv; the readers validate their single canonical path.
   if (OB_SUCC(ret)) {
-    char path_buf[PATH_MAX + 1];
-    char real_path[PATH_MAX + 1];
     ObString secure_file_priv;
-    if (OB_UNLIKELY(path.empty()) || path.length() > PATH_MAX) {
+    if (OB_UNLIKELY(path.empty()) || OB_UNLIKELY(path.length() > PATH_MAX)) {
       ret = OB_INVALID_ARGUMENT;
+    } else if (OB_FAIL(session_info_->get_secure_file_priv(secure_file_priv))) {
+    } else if (FILE_SQL_FUNC_READ_GLOB == function_kind) {
+      char pattern_buf[PATH_MAX + 1];
+      MEMCPY(pattern_buf, path.ptr(), path.length());
+      pattern_buf[path.length()] = '\0';
+      glob_t matches;
+      MEMSET(&matches, 0, sizeof(matches));
+      const int glob_ret = ::glob(pattern_buf, 0, NULL, &matches);
+      if (GLOB_NOMATCH == glob_ret) {
+        // An empty match set is a valid, empty table.
+        ::globfree(&matches);
+      } else if (0 != glob_ret) {
+        ::globfree(&matches);
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("glob failed", K(ret), K(path), K(glob_ret));
+      } else {
+        std::vector<std::string> paths;
+        paths.reserve(matches.gl_pathc);
+        for (size_t i = 0; i < matches.gl_pathc; ++i) {
+          const char *match = matches.gl_pathv[i];
+          char real_path[PATH_MAX + 1];
+          if (OB_ISNULL(match)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_ISNULL(::realpath(match, real_path))) {
+            ret = OB_FILE_NOT_EXIST;
+            LOG_WARN("glob match cannot be canonicalized", K(ret), K(match));
+          } else if (!session_info_->is_inner() &&
+                     OB_FAIL(ObResolverUtils::check_secure_path(
+                         secure_file_priv, ObString(real_path)))) {
+            LOG_WARN("glob match is outside secure_file_priv", K(ret), K(match),
+                     K(secure_file_priv));
+          } else {
+            paths.push_back(std::string(match));
+          }
+        }
+        ::globfree(&matches);
+        if (OB_SUCC(ret)) {
+          // Natural path order, so that `select * from glob(...)` is stable.
+          std::sort(paths.begin(), paths.end());
+          for (size_t i = 0; i < paths.size(); ++i) {
+            storage::Row row;
+            row.fields.push_back(paths[i]);
+            glob_rows.push_back(std::move(row));
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        storage::Column file_column;
+        file_column.name = "file";
+        file_column.type = storage::ObFileSqlType::VARCHAR;
+        file_column.nullable = false;
+        resolved_columns.push_back(std::move(file_column));
+        fetch_rows = [&glob_rows, &glob_row_pos](std::vector<storage::Row> &rows) -> int {
+          rows.clear();
+          if (glob_row_pos < glob_rows.size()) {
+            rows.insert(rows.end(), glob_rows.begin() + glob_row_pos, glob_rows.end());
+            glob_row_pos = glob_rows.size();
+          }
+          return 0;
+        };
+        rewind_rows = [&glob_row_pos]() -> int {
+          glob_row_pos = 0;
+          return 0;
+        };
+      }
     } else {
+      char path_buf[PATH_MAX + 1];
+      char real_path[PATH_MAX + 1];
       MEMCPY(path_buf, path.ptr(), path.length());
       path_buf[path.length()] = '\0';
       if (OB_ISNULL(::realpath(path_buf, real_path))) {
         ret = OB_FILE_NOT_EXIST;
-        LOG_WARN("read_csv file does not exist", K(ret), K(path));
-      } else if (OB_FAIL(session_info_->get_secure_file_priv(secure_file_priv))) {
+        LOG_WARN("file does not exist", K(ret), K(path));
       } else if (!session_info_->is_inner() &&
-                 OB_FAIL(ObResolverUtils::check_secure_path(secure_file_priv, ObString(real_path)))) {
+                 OB_FAIL(ObResolverUtils::check_secure_path(secure_file_priv,
+                                                            ObString(real_path)))) {
         LOG_WARN("file is outside secure_file_priv", K(ret), K(path), K(secure_file_priv));
-      } else {
+      } else if (FILE_SQL_FUNC_READ_CSV == function_kind) {
         options.sample_size = -1;
         if (0 != reader.open(std::string(real_path), options)) {
           ret = OB_FILE_NOT_EXIST;
         } else if (0 != reader.infer_schema()) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("failed to infer the csv schema", K(ret), K(path));
+        } else {
+          resolved_columns = reader.columns();
+          fetch_rows = [&reader](std::vector<storage::Row> &rows) -> int {
+            return reader.next_batch(1024, rows);
+          };
+          rewind_rows = [&reader]() -> int {
+            return reader.rewind();
+          };
+        }
+      } else if (FILE_SQL_FUNC_READ_PARQUET == function_kind) {
+        storage::ObParquetOptions parquet_options;
+        if (0 != parquet_reader.open(std::string(real_path), parquet_options)) {
+          const storage::ObParquetReadError read_error = parquet_reader.last_error();
+          if (storage::ObParquetReadError::UNSUPPORTED == read_error) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, parquet_reader.last_error_message().c_str());
+          } else if (storage::ObParquetReadError::OPEN == read_error) {
+            ret = OB_FILE_NOT_EXIST;
+          } else {
+            ret = OB_ERR_UNEXPECTED;
+          }
+          LOG_WARN("failed to open the parquet file", K(ret), K(path),
+                   K(parquet_reader.last_error_message().c_str()));
+        } else if (0 != parquet_reader.infer_schema()) {
+          const storage::ObParquetReadError read_error = parquet_reader.last_error();
+          if (storage::ObParquetReadError::UNSUPPORTED == read_error) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, parquet_reader.last_error_message().c_str());
+          } else if (storage::ObParquetReadError::FORMAT == read_error) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "Parquet file");
+          } else {
+            ret = OB_ERR_UNEXPECTED;
+          }
+          LOG_WARN("failed to read the parquet file", K(ret), K(path),
+                   K(parquet_reader.last_error_message().c_str()));
+        } else {
+          resolved_columns = parquet_reader.columns();
+          fetch_rows = [&parquet_reader](std::vector<storage::Row> &rows) -> int {
+            return parquet_reader.next_batch(1024, rows);
+          };
+          rewind_rows = [&parquet_reader]() -> int {
+            return parquet_reader.rewind();
+          };
+        }
+      } else {
+        storage::ObJsonOptions json_options;
+        if (0 != json_reader.open(std::string(real_path), json_options)) {
+          ret = OB_FILE_NOT_EXIST;
+        } else if (0 != json_reader.infer_schema()) {
+          if (storage::ObJsonReadError::NESTED == json_reader.last_error()) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, json_reader.last_error_message().c_str());
+          } else if (storage::ObJsonReadError::PARSE == json_reader.last_error()) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "newline-delimited JSON record");
+          } else {
+            ret = OB_ERR_UNEXPECTED;
+          }
+          LOG_WARN("failed to infer the json schema", K(ret), K(path),
+                   K(json_reader.last_error_message().c_str()));
+        } else {
+          resolved_columns = json_reader.columns();
+          fetch_rows = [&json_reader](std::vector<storage::Row> &rows) -> int {
+            return json_reader.next_batch(1024, rows);
+          };
+          rewind_rows = [&json_reader]() -> int {
+            return json_reader.rewind();
+          };
         }
       }
     }
@@ -11412,12 +11612,12 @@ int ObDMLResolver::resolve_read_file_item(const ParseNode &parse_tree, TableItem
   }
 
   // Column types (and the metadata used by DESCRIBE).
-  const std::vector<storage::Column> &columns = reader.columns();
+  const std::vector<storage::Column> &columns = resolved_columns;
   std::vector<int64_t> max_lengths;
   if (OB_SUCC(ret)) {
     if (OB_UNLIKELY(columns.empty())) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("read_csv inferred no column", K(ret));
+      LOG_WARN("file table function inferred no column", K(ret));
     } else if (OB_FAIL(values_def->column_types_.reserve(columns.size()))) {
     } else if (OB_FAIL(file_def->columns_.reserve(columns.size()))) {
     } else {
@@ -11455,12 +11655,12 @@ int ObDMLResolver::resolve_read_file_item(const ParseNode &parse_tree, TableItem
   if (OB_SUCC(ret)) {
     const int64_t column_count = static_cast<int64_t>(columns.size());
     int64_t row_count = 0;
-    if (0 != reader.rewind()) {
+    if (!rewind_rows || 0 != rewind_rows()) {
       ret = OB_ERR_UNEXPECTED;
     }
     while (OB_SUCC(ret)) {
       std::vector<storage::Row> rows;
-      if (0 != reader.next_batch(1024, rows)) {
+      if (!fetch_rows || 0 != fetch_rows(rows)) {
         ret = OB_ERR_UNEXPECTED;
       } else if (rows.empty()) {
         break;
@@ -11518,6 +11718,14 @@ int ObDMLResolver::resolve_read_file_item(const ParseNode &parse_tree, TableItem
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else if (OB_NOT_NULL(alias_node = parse_tree.children_[1])) {
       table_name.assign_ptr(alias_node->str_value_, static_cast<int32_t>(alias_node->str_len_));
+    } else if (FILE_SQL_FUNC_READ_JSON == function_kind) {
+      table_name = ObString::make_string("read_json");
+    } else if (FILE_SQL_FUNC_READ_NDJSON == function_kind) {
+      table_name = ObString::make_string("read_ndjson");
+    } else if (FILE_SQL_FUNC_READ_GLOB == function_kind) {
+      table_name = ObString::make_string("glob");
+    } else if (FILE_SQL_FUNC_READ_PARQUET == function_kind) {
+      table_name = ObString::make_string("read_parquet");
     } else {
       table_name = ObString::make_string("read_csv");
     }

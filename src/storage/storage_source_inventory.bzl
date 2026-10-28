@@ -11,6 +11,8 @@ STORAGE_UNITY_GROUPS = [
         srcs = [
             "src/storage/file_sql/ob_file_sql_type.cpp",
             "src/storage/file_sql/ob_csv_reader.cpp",
+            "src/storage/file_sql/ob_json_reader.cpp",
+            "src/storage/file_sql/ob_parquet_reader.cpp",
         ],
         generated_srcs = [],
         external_srcs = [],

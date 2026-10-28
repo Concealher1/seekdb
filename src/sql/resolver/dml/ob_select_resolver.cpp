@@ -3032,6 +3032,16 @@ int ObSelectResolver::resolve_into_outfile_with_format(const ParseNode *node, Ob
       } else if (OB_FAIL(ObResolverUtils::resolve_file_format(option_node, external_format, params_))) {
       }
     }
+    if (OB_SUCC(ret) && external_format.csv_format_.parse_header_) {
+      // PARSE_HEADER on an INTO OUTFILE statement means "write a header row".
+      into_item.with_header_ = true;
+    }
+    if (OB_SUCC(ret) && external_format.csv_format_.null_if_.count() > 0) {
+      if (OB_FAIL(ob_write_string(*allocator_,
+                                  external_format.csv_format_.null_if_.at(0),
+                                  into_item.null_str_))) {
+      }
+    }
     if (OB_SUCC(ret)
         && OB_FAIL(external_format.to_string_with_alloc(into_item.external_properties_, *allocator_, true))) {
     }
