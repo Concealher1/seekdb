@@ -47,6 +47,12 @@ private:
 
   template <typename SelectResolverType>
   int select_stmt_resolver_func(ObResolverParams &params, const ParseNode &parse_tree, ObStmt *&stmt);
+
+  // DESCRIBE SELECT ... : resolves the query and returns a one-row-per-column
+  // description result set instead of the query result.
+  int resolve_describe_select(IsPrepared if_prepared,
+                              const ParseNode &parse_tree,
+                              ObStmt *&stmt);
 private:
   // data members
   ObResolverParams params_;

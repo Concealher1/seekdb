@@ -41,7 +41,6 @@
 #include "../../../src/sql/parser/sql_parser_base.h"
 
 #define GEN_EXPLAN_STMT(no_use, explain_stmt, explain_type, display_type, stmt, into_table, set_statement_id) \
-  (void)(no_use); \
   ParseNode *type_node = NULL; \
   ParseNode *display_node = NULL; \
   if (0 != explain_type) { \
@@ -49,6 +48,12 @@
   } \
   if (0 != display_type) { \
     malloc_terminal_node(display_node, result->malloc_pool_, display_type); \
+  } \
+  /* DESCRIBE SELECT ... and EXPLAIN SELECT ... share the T_EXPLAIN node. */ \
+  /* DESCRIBE is marked by a T_INT display child whose value is 1.        */ \
+  if (0 == display_type && NULL != (no_use)) { \
+    malloc_terminal_node(display_node, result->malloc_pool_, T_INT); \
+    display_node->value_ = (no_use)->value_; \
   } \
   malloc_non_terminal_node(explain_stmt, result->malloc_pool_, T_EXPLAIN, 5, \
                            type_node, display_node, into_table, set_statement_id, stmt);
@@ -299,6 +304,7 @@ END_P SET_VAR DELIMITER
         INVISIBLE MERGE ISNULL INTERSECT INCREMENTAL INNER_PARSE ILOGCACHE INPUT INDEXED INCONSISTENT INDIVIDUAL
 
         JOB JSON JSON_ARRAYAGG JSON_OBJECTAGG JSON_QUERY JSON_VALUE JSON_TABLE
+        READ_CSV READ_JSON READ_NDJSON READ_PARQUET GLOB_
 
         KEYWORD KEY_BLOCK_SIZE KEY_VERSION KVCACHE
 
@@ -497,6 +503,7 @@ END_P SET_VAR DELIMITER
 %type <node> dynamic_sampling_hint
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
+%type <node> read_file_expr file_arg_list file_arg named_file_arg file_arg_name
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
@@ -10831,6 +10838,10 @@ tbl_name
   unname_node->sql_str_off_ = @2.first_column;
   $$->value_ = 1; //lateral
 }
+| read_file_expr
+{
+  $$ = $1;
+}
 | json_table_expr
 {
   $$ = $1;
@@ -12306,7 +12317,11 @@ explain_or_desc relation_factor opt_desc_column_option
 
 explain_or_desc:
 EXPLAIN {$$ = NULL;}
-| DESCRIBE {$$ = NULL;}
+| DESCRIBE
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 1;
+}
 | DESC  {$$ = NULL;}
 ;
 
@@ -17428,6 +17443,124 @@ JSON '(' column_name ')' STORE AS '(' lob_storage_parameters ')'
 }
 ;
 
+read_file_expr:
+READ_CSV '(' file_arg_list ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_READ_FILE_EXPRESSION, 2, $3, $5);
+  $$->value_ = READ_FILE_FUNC_CSV;
+}
+| READ_CSV '(' file_arg_list ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_READ_FILE_EXPRESSION, 2, $3, $6);
+  $$->value_ = READ_FILE_FUNC_CSV;
+}
+| READ_CSV '(' file_arg_list ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_READ_FILE_EXPRESSION, 2, $3, NULL);
+  $$->value_ = READ_FILE_FUNC_CSV;
+}
+| READ_JSON '(' file_arg_list ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_READ_FILE_EXPRESSION, 2, $3, $5);
+  $$->value_ = READ_FILE_FUNC_JSON;
+}
+| READ_JSON '(' file_arg_list ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_READ_FILE_EXPRESSION, 2, $3, $6);
+  $$->value_ = READ_FILE_FUNC_JSON;
+}
+| READ_JSON '(' file_arg_list ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_READ_FILE_EXPRESSION, 2, $3, NULL);
+  $$->value_ = READ_FILE_FUNC_JSON;
+}
+| READ_NDJSON '(' file_arg_list ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_READ_FILE_EXPRESSION, 2, $3, $5);
+  $$->value_ = READ_FILE_FUNC_NDJSON;
+}
+| READ_NDJSON '(' file_arg_list ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_READ_FILE_EXPRESSION, 2, $3, $6);
+  $$->value_ = READ_FILE_FUNC_NDJSON;
+}
+| READ_NDJSON '(' file_arg_list ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_READ_FILE_EXPRESSION, 2, $3, NULL);
+  $$->value_ = READ_FILE_FUNC_NDJSON;
+}
+| READ_PARQUET '(' file_arg_list ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_READ_FILE_EXPRESSION, 2, $3, $5);
+  $$->value_ = READ_FILE_FUNC_PARQUET;
+}
+| READ_PARQUET '(' file_arg_list ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_READ_FILE_EXPRESSION, 2, $3, $6);
+  $$->value_ = READ_FILE_FUNC_PARQUET;
+}
+| READ_PARQUET '(' file_arg_list ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_READ_FILE_EXPRESSION, 2, $3, NULL);
+  $$->value_ = READ_FILE_FUNC_PARQUET;
+}
+| GLOB_ '(' file_arg_list ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_READ_FILE_EXPRESSION, 2, $3, $5);
+  $$->value_ = READ_FILE_FUNC_GLOB;
+}
+| GLOB_ '(' file_arg_list ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_READ_FILE_EXPRESSION, 2, $3, $6);
+  $$->value_ = READ_FILE_FUNC_GLOB;
+}
+| GLOB_ '(' file_arg_list ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_READ_FILE_EXPRESSION, 2, $3, NULL);
+  $$->value_ = READ_FILE_FUNC_GLOB;
+}
+;
+
+file_arg_list:
+file_arg
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_EXPR_LIST, 1, $1);
+}
+| file_arg_list ',' named_file_arg
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_EXPR_LIST, 2, $1, $3);
+}
+;
+
+file_arg:
+conf_const
+{
+  $$ = $1;
+}
+| named_file_arg
+{
+  $$ = $1;
+}
+;
+
+named_file_arg:
+file_arg_name COMP_EQ conf_const
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_READ_FILE_ARG, 2, $1, $3);
+}
+;
+
+file_arg_name:
+NAME_OB
+{
+  $$ = $1;
+}
+| unreserved_keyword
+{
+  get_non_reserved_node($$, result->malloc_pool_, @1.first_column, @1.last_column);
+}
+;
+
 unnest_expr:
 UNNEST '(' simple_expr_list ')' 
 {
@@ -17753,6 +17886,11 @@ ACCOUNT
 |       JSON_OBJECTAGG
 |       JSON_QUERY
 |       JSON_TABLE
+|       READ_CSV
+|       READ_JSON
+|       READ_NDJSON
+|       READ_PARQUET
+|       GLOB_
 |       KEYWORD
 |       KEY_BLOCK_SIZE
 |       KEY_VERSION

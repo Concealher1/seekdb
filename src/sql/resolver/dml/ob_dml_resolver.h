@@ -777,6 +777,7 @@ private:
   int replace_pl_relative_expr_to_question_mark(ObRawExpr *&real_ref_expr);
   bool check_expr_has_colref(ObRawExpr *expr);
 
+  int resolve_read_file_item(const ParseNode &table_node, TableItem *&table_item);
   int resolve_values_table_item(const ParseNode &table_node, TableItem *&table_item);
   int resolve_values_table_for_select(const ParseNode &table_node,
                                       ObValuesTableDef &table_values);

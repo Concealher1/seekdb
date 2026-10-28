@@ -194,6 +194,8 @@ int TableItem::deep_copy(ObIRawExprCopier &expr_copier,
   } else if (OB_FAIL(part_names_.assign(other.part_names_))) {
   } else if (is_values_table() &&
              OB_FAIL(deep_copy_values_table_def(*other.values_table_def_, expr_copier, allocator))) {
+  } else if (NULL != other.file_sql_def_ &&
+             OB_FAIL(deep_copy_file_sql_def(*other.file_sql_def_, allocator))) {
   } else { /* do nothing */ }
   if (OB_SUCC(ret)) {
     if (OB_ISNULL(other.sample_info_)) {
@@ -4462,6 +4464,33 @@ int TableItem::deep_copy_values_table_def(const ObValuesTableDef& table_def,
   } else {
     values_table_def_ = new (tmp) ObValuesTableDef();
     if (OB_FAIL(values_table_def_->deep_copy(table_def, expr_copier, allocator))) {
+    }
+  }
+  return ret;
+}
+
+int TableItem::deep_copy_file_sql_def(const ObFileSqlTableDef &file_def,
+                                      ObIAllocator *allocator)
+{
+  int ret = OB_SUCCESS;
+  void *tmp = nullptr;
+  if (OB_ISNULL(allocator)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(tmp = allocator->alloc(sizeof(ObFileSqlTableDef)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    file_sql_def_ = new (tmp) ObFileSqlTableDef();
+    file_sql_def_->function_kind_ = file_def.function_kind_;
+    file_sql_def_->row_count_ = file_def.row_count_;
+    if (OB_FAIL(ob_write_string(*allocator, file_def.path_, file_sql_def_->path_))) {
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < file_def.columns_.count(); ++i) {
+      ObFileSqlColumnDef column;
+      column.type_ = file_def.columns_.at(i).type_;
+      column.nullable_ = file_def.columns_.at(i).nullable_;
+      if (OB_FAIL(ob_write_string(*allocator, file_def.columns_.at(i).name_, column.name_))) {
+      } else if (OB_FAIL(file_sql_def_->columns_.push_back(column))) {
+      }
     }
   }
   return ret;

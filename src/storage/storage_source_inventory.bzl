@@ -6,6 +6,16 @@ STORAGE_TABLET_AUTOINCREMENT_STATE_SOURCES = [
 
 STORAGE_UNITY_GROUPS = [
     struct(
+        name = "ob_storage_file_sql_0",
+        language = "c++",
+        srcs = [
+            "src/storage/file_sql/ob_file_sql_type.cpp",
+            "src/storage/file_sql/ob_csv_reader.cpp",
+        ],
+        generated_srcs = [],
+        external_srcs = [],
+    ),
+    struct(
         name = "ob_storage_access_0",
         language = "c++",
         srcs = [

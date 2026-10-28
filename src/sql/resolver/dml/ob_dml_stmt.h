@@ -129,6 +129,41 @@ struct ObValuesTableDef {
                        K(access_type_), K(is_const_), K(column_types_));
 };
 
+// Kind of the table function that produced a file table.  The values match
+// the READ_FILE_FUNC_* constants stored in ParseNode::value_ by the parser.
+enum ObFileSqlFunctionKind
+{
+  FILE_SQL_FUNC_INVALID = 0,
+  FILE_SQL_FUNC_READ_CSV = 1,
+  FILE_SQL_FUNC_READ_JSON = 2,
+  FILE_SQL_FUNC_READ_NDJSON = 3,
+  FILE_SQL_FUNC_READ_PARQUET = 4,
+  FILE_SQL_FUNC_READ_GLOB = 5,
+};
+
+// One column of the schema inferred from a file.
+struct ObFileSqlColumnDef
+{
+  ObFileSqlColumnDef() : name_(), type_(0), nullable_(false) {}
+  common::ObString name_;
+  // storage::ObFileSqlType, kept as int to avoid a storage dependency here.
+  int32_t type_;
+  bool nullable_;
+};
+
+// Resolve-time description of a read_csv/read_json/... table.  The rows of
+// the file are materialised in the TableItem::values_table_def_ of the same
+// table item; this structure keeps the file identity and inferred schema so
+// that DESCRIBE and EXPLAIN can report them.
+struct ObFileSqlTableDef
+{
+  ObFileSqlTableDef() : function_kind_(0), path_(), columns_(), row_count_(0) {}
+  int32_t function_kind_;
+  common::ObString path_;
+  common::ObSEArray<ObFileSqlColumnDef, 8, common::ModulePageAllocator, true> columns_;
+  int64_t row_count_;
+};
+
 struct TableItem
 {
   TableItem()
@@ -155,6 +190,7 @@ struct TableItem
     json_table_def_ = nullptr;
     table_type_ = MAX_TABLE_TYPE;
     values_table_def_ = NULL;
+    file_sql_def_ = NULL;
     sample_info_ = nullptr;
   }
 
@@ -263,6 +299,7 @@ struct TableItem
   int deep_copy_values_table_def(const ObValuesTableDef& table_def,
                                  ObIRawExprCopier &expr_copier,
                                  ObIAllocator* allocator);
+  int deep_copy_file_sql_def(const ObFileSqlTableDef &file_def, ObIAllocator *allocator);
   virtual bool has_for_update() const { return for_update_; }
   // if real table id, it is valid for all threads,
   // else if generated id, it is unique just during the thread session
@@ -303,6 +340,8 @@ struct TableItem
   ObJsonTableDef *json_table_def_;
   // values table
   ObValuesTableDef *values_table_def_;
+  // set only for tables produced by a file-as-database table function
+  ObFileSqlTableDef *file_sql_def_;
   // sample scan infos
   SampleInfo *sample_info_;
 };

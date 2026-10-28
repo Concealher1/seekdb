@@ -41,6 +41,13 @@
 #include "sql/resolver/dcl/ob_dcl_resolver.h"
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/hybrid_search/ob_hybrid_search_executor.h"
+#include "common/timezone/ob_time_convert.h"
+#include "storage/file_sql/ob_csv_reader.h"
+#include "storage/file_sql/ob_file_sql_type.h"
+#include <algorithm>
+#include <climits>
+#include <cstdlib>
+#include <string>
 
 namespace oceanbase
 {
@@ -2703,6 +2710,10 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
       }
       case T_JSON_TABLE_EXPRESSION: {
         OZ (resolve_json_table_item(*table_node, table_item));
+        break;
+      }
+      case T_READ_FILE_EXPRESSION: {
+        OZ (resolve_read_file_item(*table_node, table_item));
         break;
       }
       case T_UNNEST_EXPRESSION: {
@@ -11071,6 +11082,485 @@ int ObDMLResolver::resolve_table_dynamic_sampling_hint(const ParseNode &hint_nod
     dynamic_sampling_hint->set_qb_name(qb_name);
     dynamic_sampling_hint->set_sample_block_cnt(sample_block_cnt);
     opt_hint = dynamic_sampling_hint;
+  }
+  return ret;
+}
+
+namespace
+{
+// M3: file-as-database table function support.  read_csv() and friends are
+// resolved into a constant VALUES table: the file is opened and scanned once
+// while resolving, every row becomes a constant expression, and the table
+// item keeps the file identity plus the inferred schema for DESCRIBE.
+
+int file_sql_get_string_arg(const ParseNode *node, ObString &value)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (T_VARCHAR == node->type_ || T_CHAR == node->type_) {
+    value.assign_ptr(node->str_value_, static_cast<int32_t>(node->str_len_));
+  } else {
+    ret = OB_ERR_PARSER_SYNTAX;
+  }
+  return ret;
+}
+
+int file_sql_get_bool_arg(const ParseNode *node, bool &value)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (T_BOOL == node->type_) {
+    value = (0 != node->value_);
+  } else if (T_INT == node->type_ || T_UINT64 == node->type_ || T_NUMBER == node->type_) {
+    value = (0 != node->value_);
+  } else if (T_VARCHAR == node->type_ || T_CHAR == node->type_) {
+    ObString text(static_cast<int32_t>(node->str_len_), node->str_value_);
+    if (0 == text.case_compare("true") || 0 == text.case_compare("on") ||
+        0 == text.case_compare("1")) {
+      value = true;
+    } else if (0 == text.case_compare("false") || 0 == text.case_compare("off") ||
+               0 == text.case_compare("0")) {
+      value = false;
+    } else {
+      ret = OB_ERR_PARSER_SYNTAX;
+    }
+  } else {
+    ret = OB_ERR_PARSER_SYNTAX;
+  }
+  return ret;
+}
+
+int file_sql_get_int_arg(const ParseNode *node, int64_t &value)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (T_INT == node->type_ || T_UINT64 == node->type_ || T_NUMBER == node->type_) {
+    value = node->value_;
+  } else {
+    ret = OB_ERR_PARSER_SYNTAX;
+  }
+  return ret;
+}
+
+ObObjType file_sql_obj_type(const int32_t file_type)
+{
+  ObObjType type = ObVarcharType;
+  switch (static_cast<storage::ObFileSqlType>(file_type)) {
+    case storage::ObFileSqlType::BOOLEAN:
+      type = ObTinyIntType;
+      break;
+    case storage::ObFileSqlType::BIGINT:
+      type = ObIntType;
+      break;
+    case storage::ObFileSqlType::DOUBLE:
+      type = ObDoubleType;
+      break;
+    case storage::ObFileSqlType::DATE:
+      type = ObDateType;
+      break;
+    case storage::ObFileSqlType::DATETIME:
+      type = ObDateTimeType;
+      break;
+    default:
+      type = ObVarcharType;
+      break;
+  }
+  return type;
+}
+
+// Build one constant expression for a CSV cell.  NULL cells (empty fields)
+// become T_NULL expressions; the values-table layer casts them to the
+// column type afterwards.
+int file_sql_build_cell_expr(ObRawExprFactory &expr_factory,
+                             const ObString &cell,
+                             const int32_t file_type,
+                             const ObCollationType cs_type,
+                             const ObTimeZoneInfo *tz_info,
+                             ObIAllocator &allocator,
+                             ObRawExpr *&expr)
+{
+  int ret = OB_SUCCESS;
+  expr = NULL;
+  const storage::ObFileSqlType type = static_cast<storage::ObFileSqlType>(file_type);
+  std::string text(cell.ptr(), static_cast<size_t>(cell.length()));
+  ObConstRawExpr *const_expr = NULL;
+  if (cell.empty()) {
+    if (OB_FAIL(ObRawExprUtils::build_null_expr(expr_factory, expr))) {
+    }
+  } else if (storage::ObFileSqlType::BOOLEAN == type) {
+    bool value = false;
+    if (!storage::ob_file_sql_parse_boolean(text, value)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(ObRawExprUtils::build_const_bool_expr(&expr_factory, expr, value))) {
+    }
+  } else if (storage::ObFileSqlType::BIGINT == type) {
+    int64_t value = 0;
+    if (!storage::ob_file_sql_parse_bigint(text, value)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(expr_factory, ObIntType, value, const_expr))) {
+    } else {
+      expr = const_expr;
+    }
+  } else if (storage::ObFileSqlType::DOUBLE == type) {
+    double value = 0.0;
+    if (!storage::ob_file_sql_parse_double(text, value)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(ObRawExprUtils::build_const_double_expr(expr_factory, ObDoubleType, value, const_expr))) {
+    } else {
+      expr = const_expr;
+    }
+  } else if (storage::ObFileSqlType::DATE == type) {
+    int32_t value = 0;
+    if (OB_FAIL(ObTimeConverter::str_to_date(cell, value))) {
+    } else if (OB_FAIL(ObRawExprUtils::build_const_date_expr(expr_factory, value, const_expr))) {
+    } else {
+      expr = const_expr;
+    }
+  } else if (storage::ObFileSqlType::DATETIME == type) {
+    int64_t value = 0;
+    int16_t scale = 0;
+    ObTimeConvertCtx cvrt_ctx(tz_info, false);
+    std::replace(text.begin(), text.end(), 'T', ' ');
+    ObString datetime_text(static_cast<int32_t>(text.size()), text.data());
+    if (OB_FAIL(ObTimeConverter::str_to_datetime(datetime_text, cvrt_ctx, value, &scale))) {
+    } else if (OB_FAIL(ObRawExprUtils::build_const_datetime_expr(expr_factory, value, const_expr))) {
+    } else {
+      expr = const_expr;
+    }
+  } else {
+    ObString stored;
+    if (OB_FAIL(ob_write_string(allocator, cell, stored))) {
+    } else if (OB_FAIL(ObRawExprUtils::build_const_string_expr(
+                 expr_factory, ObVarcharType, stored, cs_type, const_expr))) {
+    } else {
+      expr = const_expr;
+    }
+  }
+  return ret;
+}
+
+} // anonymous namespace
+
+int ObDMLResolver::resolve_read_file_item(const ParseNode &parse_tree, TableItem *&table_item)
+{
+  int ret = OB_SUCCESS;
+  ObDMLStmt *stmt = get_stmt();
+  ObValuesTableDef *values_def = NULL;
+  ObFileSqlTableDef *file_def = NULL;
+  storage::ObCSVReader reader;
+  storage::ObCsvOptions options;
+  bool enable_file_sql = false;
+  ObString path;
+  ObCollationType cs_type = CS_TYPE_UTF8MB4_GENERAL_CI;
+  const ParseNode *args_node = NULL;
+  const ParseNode *alias_node = NULL;
+  ObString table_name;
+  int32_t function_kind = 0;
+  if (OB_UNLIKELY(T_READ_FILE_EXPRESSION != parse_tree.type_ || 2 != parse_tree.num_child_) ||
+      OB_ISNULL(args_node = parse_tree.children_[0]) ||
+      OB_ISNULL(stmt) || OB_ISNULL(session_info_) || OB_ISNULL(allocator_) ||
+      OB_ISNULL(params_.expr_factory_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid read file expression", K(ret), K(parse_tree.type_), K(parse_tree.num_child_));
+  } else if (OB_UNLIKELY(T_EXPR_LIST != args_node->type_ || args_node->num_child_ < 1)) {
+    ret = OB_ERR_PARSER_SYNTAX;
+  } else if (OB_FAIL(session_info_->get_enable_file_sql(enable_file_sql))) {
+  } else if (!enable_file_sql) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table function without enable_file_sql");
+  } else if (OB_UNLIKELY(parse_tree.value_ < FILE_SQL_FUNC_READ_CSV ||
+                         parse_tree.value_ > FILE_SQL_FUNC_READ_GLOB)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FALSE_IT(function_kind = static_cast<int32_t>(parse_tree.value_))) {
+  } else if (FILE_SQL_FUNC_READ_CSV != function_kind) {
+    // Only CSV execution is implemented in this milestone slice; the parser
+    // and the AST already carry the function kind for the other readers.
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "this file table function is not implemented yet");
+  } else if (OB_FAIL(file_sql_get_string_arg(args_node->children_[0], path))) {
+    LOG_WARN("read_csv expects a string literal file path", K(ret));
+  } else if (OB_FAIL(session_info_->get_collation_connection(cs_type))) {
+  }
+
+  // Named arguments and validation of the rejected syntax.
+  for (int64_t i = 1; OB_SUCC(ret) && i < args_node->num_child_; ++i) {
+    const ParseNode *arg = args_node->children_[i];
+    const ParseNode *value_node = NULL;
+    const ParseNode *name_node = NULL;
+    ObString arg_name;
+    if (OB_ISNULL(arg)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_UNLIKELY(T_READ_FILE_ARG != arg->type_ || 2 != arg->num_child_) ||
+               OB_ISNULL(name_node = arg->children_[0]) ||
+               OB_ISNULL(value_node = arg->children_[1])) {
+      // read_csv('f', 'xml') and other positional arguments are a syntax error.
+      ret = OB_ERR_PARSE_SQL;
+    } else {
+      arg_name.assign_ptr(name_node->str_value_, static_cast<int32_t>(name_node->str_len_));
+      LOG_ERROR("read_csv arg probe", K(arg->type_), K(arg->num_child_), K(arg_name),
+                K(name_node->str_len_), K(value_node->type_), K(value_node->num_child_),
+                K(args_node->num_child_));
+      if (0 == arg_name.case_compare("header")) {
+        if (OB_FAIL(file_sql_get_bool_arg(value_node, options.header))) {
+        }
+      } else if (0 == arg_name.case_compare("sample_size")) {
+        int64_t sample_size = 0;
+        if (OB_FAIL(file_sql_get_int_arg(value_node, sample_size))) {
+        } else if (-1 != sample_size) {
+          // Only a full scan is implemented, reject positive sample sizes.
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv sample_size other than -1");
+        }
+      } else if (0 == arg_name.case_compare("format")) {
+        ObString format;
+        if (OB_FAIL(file_sql_get_string_arg(value_node, format))) {
+        } else if (0 != format.case_compare("csv")) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv format other than csv");
+        }
+      } else if (0 == arg_name.case_compare("delimiter")) {
+        ObString value;
+        if (OB_FAIL(file_sql_get_string_arg(value_node, value))) {
+        } else if (1 != value.length()) {
+          ret = OB_ERR_PARSER_SYNTAX;
+        } else {
+          options.delimiter = value.ptr()[0];
+        }
+      } else if (0 == arg_name.case_compare("quote")) {
+        ObString value;
+        if (OB_FAIL(file_sql_get_string_arg(value_node, value))) {
+        } else if (1 != value.length()) {
+          ret = OB_ERR_PARSER_SYNTAX;
+        } else {
+          options.quote = value.ptr()[0];
+        }
+      } else if (0 == arg_name.case_compare("escape")) {
+        ObString value;
+        if (OB_FAIL(file_sql_get_string_arg(value_node, value))) {
+        } else if (1 != value.length()) {
+          ret = OB_ERR_PARSER_SYNTAX;
+        } else {
+          options.escape = value.ptr()[0];
+        }
+      } else if (0 == arg_name.case_compare("nullstr")) {
+        ObString value;
+        if (OB_FAIL(file_sql_get_string_arg(value_node, value))) {
+        } else {
+          options.nullstr = std::string(value.ptr(), static_cast<size_t>(value.length()));
+        }
+      } else if (0 == arg_name.case_compare("trim")) {
+        if (OB_FAIL(file_sql_get_bool_arg(value_node, options.trim))) {
+        }
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "unsupported read_csv option");
+      }
+    }
+  }
+
+  // secure_file_priv check on the canonical path.
+  if (OB_SUCC(ret)) {
+    char path_buf[PATH_MAX + 1];
+    char real_path[PATH_MAX + 1];
+    ObString secure_file_priv;
+    if (OB_UNLIKELY(path.empty()) || path.length() > PATH_MAX) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      MEMCPY(path_buf, path.ptr(), path.length());
+      path_buf[path.length()] = '\0';
+      if (OB_ISNULL(::realpath(path_buf, real_path))) {
+        ret = OB_FILE_NOT_EXIST;
+        LOG_WARN("read_csv file does not exist", K(ret), K(path));
+      } else if (OB_FAIL(session_info_->get_secure_file_priv(secure_file_priv))) {
+      } else if (!session_info_->is_inner() &&
+                 OB_FAIL(ObResolverUtils::check_secure_path(secure_file_priv, ObString(real_path)))) {
+        LOG_WARN("file is outside secure_file_priv", K(ret), K(path), K(secure_file_priv));
+      } else {
+        options.sample_size = -1;
+        if (0 != reader.open(std::string(real_path), options)) {
+          ret = OB_FILE_NOT_EXIST;
+        } else if (0 != reader.infer_schema()) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("failed to infer the csv schema", K(ret), K(path));
+        }
+      }
+    }
+  }
+
+  // Build the values table that holds the file rows.
+  if (OB_SUCC(ret)) {
+    void *buf = NULL;
+    if (OB_ISNULL(buf = allocator_->alloc(sizeof(ObValuesTableDef)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      values_def = new (buf) ObValuesTableDef();
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(buf = allocator_->alloc(sizeof(ObFileSqlTableDef)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      file_def = new (buf) ObFileSqlTableDef();
+    }
+    if (OB_SUCC(ret)) {
+      file_def->function_kind_ = function_kind;
+      if (OB_FAIL(ob_write_string(*allocator_, path, file_def->path_))) {
+      }
+    }
+  }
+
+  // Column types (and the metadata used by DESCRIBE).
+  const std::vector<storage::Column> &columns = reader.columns();
+  std::vector<int64_t> max_lengths;
+  if (OB_SUCC(ret)) {
+    if (OB_UNLIKELY(columns.empty())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("read_csv inferred no column", K(ret));
+    } else if (OB_FAIL(values_def->column_types_.reserve(columns.size()))) {
+    } else if (OB_FAIL(file_def->columns_.reserve(columns.size()))) {
+    } else {
+      max_lengths.assign(columns.size(), 1);
+    }
+  }
+  for (size_t i = 0; OB_SUCC(ret) && i < columns.size(); ++i) {
+    const storage::Column &column = columns[i];
+    const ObObjType obj_type = file_sql_obj_type(static_cast<int32_t>(column.type));
+    ObRawExprResType result_type;
+    ObFileSqlColumnDef column_def;
+    ObString stored_name;
+    if (OB_FAIL(ob_write_string(*allocator_,
+                                ObString(static_cast<int32_t>(column.name.size()),
+                                         column.name.c_str()),
+                                stored_name))) {
+    } else {
+      column_def.type_ = static_cast<int32_t>(column.type);
+      column_def.nullable_ = column.nullable;
+      result_type.set_type(obj_type);
+      if (ob_is_string_type(obj_type)) {
+        result_type.set_collation_type(cs_type);
+        result_type.set_collation_level(CS_LEVEL_IMPLICIT);
+        result_type.set_length(OB_MAX_VARCHAR_LENGTH);
+      }
+      if (OB_FAIL(ob_write_string(*allocator_, stored_name, column_def.name_))) {
+      } else if (OB_FAIL(values_def->column_types_.push_back(result_type))) {
+      } else if (OB_FAIL(file_def->columns_.push_back(column_def))) {
+      }
+    }
+  }
+
+  // Materialise the rows.  The reader itself stays streaming: it hands out
+  // fixed size batches that are converted and released immediately.
+  if (OB_SUCC(ret)) {
+    const int64_t column_count = static_cast<int64_t>(columns.size());
+    int64_t row_count = 0;
+    if (0 != reader.rewind()) {
+      ret = OB_ERR_UNEXPECTED;
+    }
+    while (OB_SUCC(ret)) {
+      std::vector<storage::Row> rows;
+      if (0 != reader.next_batch(1024, rows)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (rows.empty()) {
+        break;
+      } else {
+        for (size_t r = 0; OB_SUCC(ret) && r < rows.size(); ++r) {
+          const storage::Row &row = rows[r];
+          for (int64_t c = 0; OB_SUCC(ret) && c < column_count; ++c) {
+            ObString cell;
+            ObRawExpr *expr = NULL;
+            if (c < static_cast<int64_t>(row.size())) {
+              const std::string &value = row.fields[static_cast<size_t>(c)];
+              cell.assign_ptr(value.data(), static_cast<int32_t>(value.size()));
+              if (static_cast<int64_t>(value.size()) > max_lengths[static_cast<size_t>(c)]) {
+                max_lengths[static_cast<size_t>(c)] = static_cast<int64_t>(value.size());
+              }
+            }
+            if (OB_FAIL(file_sql_build_cell_expr(*params_.expr_factory_, cell,
+                                                 file_def->columns_.at(c).type_,
+                                                 cs_type, TZ_INFO(session_info_), *allocator_,
+                                                 expr))) {
+            } else if (OB_ISNULL(expr)) {
+              ret = OB_ERR_UNEXPECTED;
+            } else if (OB_FAIL(expr->formalize(session_info_))) {
+            } else if (OB_FAIL(values_def->access_exprs_.push_back(expr))) {
+            }
+          }
+          ++row_count;
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      values_def->column_cnt_ = column_count;
+      values_def->row_cnt_ = row_count;
+      values_def->access_type_ = ObValuesTableDef::ACCESS_EXPR;
+      file_def->row_count_ = row_count;
+      // Make the VARCHAR metadata match the widest value.
+      for (int64_t c = 0; OB_SUCC(ret) && c < column_count; ++c) {
+        if (ob_is_string_type(values_def->column_types_.at(c).get_type())) {
+          values_def->column_types_.at(c).set_length(
+              static_cast<ObLength>(max_lengths[static_cast<size_t>(c)]));
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(try_add_cast_to_values(values_def->column_types_,
+                                                         values_def->access_exprs_))) {
+      } else if (OB_FAIL(compute_values_table_row_count(*values_def))) {
+      } else if (OB_FAIL(estimate_values_table_stats(*values_def))) {
+      }
+    }
+  }
+
+  // Create the table item and its output column items.
+  TableItem *item = NULL;
+  if (OB_SUCC(ret)) {
+    if (OB_ISNULL(item = stmt->create_table_item(*allocator_))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_NOT_NULL(alias_node = parse_tree.children_[1])) {
+      table_name.assign_ptr(alias_node->str_value_, static_cast<int32_t>(alias_node->str_len_));
+    } else {
+      table_name = ObString::make_string("read_csv");
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(alias_node) && !table_name.empty()) {
+      // default table name is already set
+    }
+    if (OB_SUCC(ret)) {
+      item->table_id_ = generate_table_id();
+      item->table_name_ = table_name;
+      item->alias_name_ = table_name;
+      item->type_ = TableItem::VALUES_TABLE;
+      item->is_view_table_ = false;
+      item->values_table_def_ = values_def;
+      item->file_sql_def_ = file_def;
+      if (OB_FAIL(stmt->add_table_item(session_info_, item))) {
+      }
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < values_def->column_cnt_; ++i) {
+    ObColumnRefRawExpr *column_expr = NULL;
+    ColumnItem column_item;
+    if (OB_FAIL(params_.expr_factory_->create_raw_expr(T_REF_COLUMN, column_expr))) {
+    } else if (OB_ISNULL(column_expr)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      column_expr->set_result_type(values_def->column_types_.at(i));
+      column_expr->set_ref_id(item->table_id_, i + OB_APP_MIN_COLUMN_ID);
+      column_expr->set_column_attr(item->get_table_name(),
+                                   file_def->columns_.at(i).name_);
+      if (OB_FAIL(column_expr->add_flag(IS_COLUMN))) {
+      } else {
+        column_item.expr_ = column_expr;
+        column_item.table_id_ = column_expr->get_table_id();
+        column_item.column_id_ = column_expr->get_column_id();
+        column_item.column_name_ = column_expr->get_column_name();
+        if (OB_FAIL(stmt->add_column_item(column_item))) {
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    table_item = item;
   }
   return ret;
 }

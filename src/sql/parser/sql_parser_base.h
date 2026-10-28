@@ -37,6 +37,14 @@
 
 
 #define MAX_VARCHAR_LENGTH 4194303
+
+/* Kinds of the file-as-database table functions.  The value is stored in
+ * ParseNode::value_ of a T_READ_FILE_EXPRESSION node. */
+#define READ_FILE_FUNC_CSV 1
+#define READ_FILE_FUNC_JSON 2
+#define READ_FILE_FUNC_NDJSON 3
+#define READ_FILE_FUNC_PARQUET 4
+#define READ_FILE_FUNC_GLOB 5
 #define INT16NUM_OVERFLOW INT16_MAX
 #define OUT_OF_STR_LEN -2
 #define DEFAULT_STR_LENGTH -1

@@ -335,6 +335,10 @@ bool ObSqlParameterization::is_tree_not_param(const ParseNode *tree)
     ret_bool = true;
   } else if (T_EXTERNAL_FILE_FORMAT == tree->type_) {
     ret_bool = true;
+  } else if (T_READ_FILE_EXPRESSION == tree->type_) {
+    // A file table function keeps its literal file path and options: they
+    // are not plan cache parameters and must survive parameterization.
+    ret_bool = true;
   } else if (T_CHAR_CHARSET == tree->type_) {
     ret_bool = true;
   } else if (T_WIN_NAMED_WINDOWS == tree->type_) {//name window cannot be parameterized because the order of parameterization cannot be guaranteed
@@ -1725,9 +1729,21 @@ int ObSqlParameterization::raw_fast_parameterize_sql(ObIAllocator &allocator,
                            parse_result,
                            parse_mode,
                            false))) {
+    if (OB_ALLOCATE_MEMORY_FAILED == ret) {
+      // keep the error
+    } else {
+      // The fast parser only understands the syntax it can parameterize.
+      // Statements it does not know (for example a file table function in
+      // FROM) must not fail here: use the raw text as the key and keep no
+      // parameters, which is exactly what a not-parameterized statement
+      // produces.
+      SQL_PC_LOG(INFO, "fast parser does not support the statement, use raw sql", K(ret));
+      ret = OB_SUCCESS;
+      no_param_sql.assign_ptr(sql.ptr(), sql.length());
+    }
   }
   NG_TRACE(pc_fast_parse_end);
-  if (OB_SUCC(ret)) {
+  if (OB_SUCC(ret) && no_param_sql.empty()) {
     no_param_sql.assign(parse_result.no_param_sql_, parse_result.no_param_sql_len_);
   }
   if (OB_SUCC(ret)) {
