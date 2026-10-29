@@ -364,6 +364,8 @@ private:
       int64_t &column_count);
   int batch_add_columns_for_create_table(common::ObISQLClient &sql_client,
       const ObIArray<ObTableSchema> &table);
+  int add_ai_columns(common::ObISQLClient &sql_client,
+      const ObIArray<ObTableSchema> &tables);
   int add_columns_for_core(common::ObISQLClient &sql_client, const ObTableSchema &table);
   int add_columns_for_not_core(common::ObISQLClient &sql_client, const ObTableSchema &table);
   int add_constraints(common::ObISQLClient &sql_client, const ObTableSchema &table);

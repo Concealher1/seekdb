@@ -124,6 +124,47 @@ int assign(const ObColumnSchemaV2 &src_schema);
   //inline void set_new_nullable();
   inline void set_autoincrement(const bool is_autoincrement) { is_autoincrement_ = is_autoincrement; }
   inline void set_is_hidden(const bool is_hidden) { is_hidden_ = is_hidden; }
+  inline void set_is_ai_column(const bool is_ai_column) { is_ai_column_ = is_ai_column; }
+  inline bool is_ai_column() const { return is_ai_column_; }
+  int set_ai_column_function(const common::ObString &value) { return deep_copy_str(value, ai_column_function_); }
+  int set_ai_column_model(const common::ObString &value) { return deep_copy_str(value, ai_column_model_); }
+  int set_ai_column_expression(const common::ObString &value) { return deep_copy_str(value, ai_column_expression_); }
+  int set_ai_column_normalized_expr(const common::ObString &value) { return deep_copy_str(value, ai_column_normalized_expr_); }
+  int set_ai_column_dependencies(const common::ObString &value) { return deep_copy_str(value, ai_column_dependencies_); }
+  int set_ai_column_sync_mode(const common::ObString &value) { return deep_copy_str(value, ai_column_sync_mode_); }
+  inline void set_ai_column_max_retries(const int64_t value) { ai_column_max_retries_ = value; }
+  inline void set_ai_column_hidden_ids(const uint64_t state_id,
+                                       const uint64_t request_id,
+                                       const uint64_t result_spec_id)
+  {
+    ai_state_column_id_ = state_id;
+    ai_request_column_id_ = request_id;
+    ai_result_spec_column_id_ = result_spec_id;
+  }
+  inline const common::ObString &get_ai_column_function() const { return ai_column_function_; }
+  inline const common::ObString &get_ai_column_model() const { return ai_column_model_; }
+  inline const common::ObString &get_ai_column_expression() const { return ai_column_expression_; }
+  inline const common::ObString &get_ai_column_normalized_expr() const { return ai_column_normalized_expr_; }
+  inline const common::ObString &get_ai_column_dependencies() const { return ai_column_dependencies_; }
+  inline const common::ObString &get_ai_column_sync_mode() const { return ai_column_sync_mode_; }
+  inline int64_t get_ai_column_max_retries() const { return ai_column_max_retries_; }
+  inline uint64_t get_ai_state_column_id() const { return ai_state_column_id_; }
+  inline uint64_t get_ai_request_column_id() const { return ai_request_column_id_; }
+  inline uint64_t get_ai_result_spec_column_id() const { return ai_result_spec_column_id_; }
+  inline void reset_ai_column_info()
+  {
+    is_ai_column_ = false;
+    ai_column_function_.reset();
+    ai_column_model_.reset();
+    ai_column_expression_.reset();
+    ai_column_normalized_expr_.reset();
+    ai_column_dependencies_.reset();
+    ai_column_sync_mode_.reset();
+    ai_column_max_retries_ = 0;
+    ai_state_column_id_ = common::OB_INVALID_ID;
+    ai_request_column_id_ = common::OB_INVALID_ID;
+    ai_result_spec_column_id_ = common::OB_INVALID_ID;
+  }
   inline void set_charset_type(const common::ObCharsetType type) { charset_type_ = type; }
   inline void set_index_position(const int64_t index_position) { index_position_ = index_position; }
   // The following two functions is not used for juding if column's type is binary.
@@ -398,6 +439,17 @@ private:
   ObSkipIndexColumnAttr skip_index_attr_;
   int64_t lob_chunk_size_;
   share::ObLocalSessionVar local_session_vars_;
+  bool is_ai_column_;
+  common::ObString ai_column_function_;
+  common::ObString ai_column_model_;
+  common::ObString ai_column_expression_;
+  common::ObString ai_column_normalized_expr_;
+  common::ObString ai_column_dependencies_;
+  common::ObString ai_column_sync_mode_;
+  int64_t ai_column_max_retries_;
+  uint64_t ai_state_column_id_;
+  uint64_t ai_request_column_id_;
+  uint64_t ai_result_spec_column_id_;
 };
 
 inline int32_t ObColumnSchemaV2::get_data_length() const
