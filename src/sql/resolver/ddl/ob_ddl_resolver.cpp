@@ -34,8 +34,6 @@
 #include "sql/engine/expr/ob_obj_cast_runtime.h"
 #include "query/vector/ob_vector_index_util.h"
 #include "share/schema/ob_ai_model_mgr.h"
-#include <stdio.h>
-#include <stdarg.h>
 
 namespace oceanbase
 {
@@ -45,17 +43,6 @@ using namespace share;
 using namespace obcall;
 namespace sql
 {
-static void ai_debug(const char *fmt, ...)
-{
-  FILE *fp = fopen("/tmp/ai_debug.log", "a");
-  if (NULL != fp) {
-    va_list args;
-    va_start(args, fmt);
-    vfprintf(fp, fmt, args);
-    va_end(args);
-    fclose(fp);
-  }
-}
 
 static int collect_ai_column_refs(const ParseNode *node, ObIArray<ObString> &refs)
 {
@@ -2186,11 +2173,10 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
     if (OB_ISNULL(attrs_node)) {
       ret = OB_INVALID_ARGUMENT;
     }
-    ai_debug("resolve_normal_column_attribute col=%s num=%ld\n",
-             column.get_column_name(), NULL == attrs_node ? -1L : attrs_node->num_child_);
+
     for (int64_t i = 0; OB_SUCC(ret) && i < attrs_node->num_child_; ++i) {
       ParseNode *attr_node = attrs_node->children_[i];
-      ai_debug("  attr[%ld] type=%d AI=%d\n", i, NULL == attr_node ? -1 : attr_node->type_, T_AI_COLUMN);
+
       switch (attr_node->type_) {
       case T_CONSTR_NOT_NULL: {
         if (OB_FAIL(resolve_normal_column_attribute_constr_not_null(column, attr_node, resolve_stat))) {
@@ -3489,12 +3475,12 @@ int ObDDLResolver::resolve_collection_column(const ParseNode *type_node, ObColum
 int ObDDLResolver::resolve_ai_column(ObColumnSchemaV2 &column, ParseNode *ai_node)
 {
   int ret = OB_SUCCESS;
-  ai_debug("resolve_ai_column begin col=%s\n", column.get_column_name());
+
   ParseNode *func_node = NULL;
   ParseNode *params_node = NULL;
   ParseNode *options_node = NULL;
   if (OB_ISNULL(ai_node) || T_AI_COLUMN != ai_node->type_ || ai_node->num_child_ != 2
-      || OB_ISNULL(ai_node->children_[0]) || OB_ISNULL(ai_node->children_[1])) {
+      || OB_ISNULL(ai_node->children_[0])) {
     ret = OB_ERR_UNEXPECTED;
   } else if (FALSE_IT(func_node = ai_node->children_[0])) {
   } else if (T_FUN_SYS != func_node->type_ || func_node->num_child_ < 2
@@ -3530,7 +3516,7 @@ int ObDDLResolver::resolve_ai_column(ObColumnSchemaV2 &column, ParseNode *ai_nod
       } else if (OB_ISNULL(model_schema)) {
         ret = OB_INVALID_ARGUMENT;
         LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_function, ai model not found, please check if the model exists");
-        ai_debug("model not found %.*s\n", model_name.length(), model_name.ptr());
+
       } else if (is_complete && EndpointType::COMPLETION != model_schema->get_type()) {
         ret = OB_INVALID_ARGUMENT;
         LOG_USER_ERROR(OB_INVALID_ARGUMENT, "AI_COMPLETE requires a completion model");
@@ -3558,16 +3544,16 @@ int ObDDLResolver::resolve_ai_column(ObColumnSchemaV2 &column, ParseNode *ai_nod
                          static_cast<uint32_t>(dim_node->value_));
         }
       }
-      ai_debug("model checked ret=%d model=%.*s\n", ret, model_name.length(), model_name.ptr());
+
       if (OB_SUCC(ret)) {
         ObString sync_mode;
         int64_t max_retries = 0;
         ObString async_str("async");
         sync_mode = async_str;
         if (OB_FAIL(resolve_ai_column_options(options_node, sync_mode, max_retries))) {
-          ai_debug("options failed ret=%d\n", ret);
+
         } else {
-          ai_debug("options parsed sync=%.*s max=%ld\n", sync_mode.length(), sync_mode.ptr(), max_retries);
+
           ObString expression(func_node->str_len_, func_node->str_value_);
           ObSqlString normalized;
           const char *contract = NULL;
@@ -3583,10 +3569,10 @@ int ObDDLResolver::resolve_ai_column(ObColumnSchemaV2 &column, ParseNode *ai_nod
           ObSEArray<ObString, 4> dep_refs;
           for (int64_t i = 1; OB_SUCC(ret) && i < param_count; ++i) {
             if (OB_FAIL(collect_ai_column_refs(params_node->children_[i], dep_refs))) {
-              ai_debug("collect refs failed ret=%d i=%ld\n", ret, i);
+
             }
           }
-          ai_debug("deps collected ret=%d count=%ld\n", ret, dep_refs.count());
+
           for (int64_t i = 0; OB_SUCC(ret) && i < dep_refs.count(); ++i) {
             if (i > 0 && OB_FAIL(dependencies.append(","))) {
             } else if (OB_FAIL(dependencies.append(dep_refs.at(i).ptr(), dep_refs.at(i).length()))) {
@@ -3602,7 +3588,7 @@ int ObDDLResolver::resolve_ai_column(ObColumnSchemaV2 &column, ParseNode *ai_nod
             } else if (OB_FAIL(column.set_ai_column_sync_mode(sync_mode))) {
             } else {
               column.set_ai_column_max_retries(max_retries);
-              ai_debug("resolved col=%s expr=%.*s deps=%.*s max=%ld\n", column.get_column_name(), column.get_ai_column_expression().length(), column.get_ai_column_expression().ptr(), column.get_ai_column_dependencies().length(), column.get_ai_column_dependencies().ptr(), max_retries);
+
             }
           }
         }
