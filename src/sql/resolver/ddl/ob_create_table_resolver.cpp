@@ -633,6 +633,7 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
     // Store the column schema after resolve_column_definition in resolved_cols
     // To support generating columns in any order, all column_schema are generated first and then uniformly stored in table_schema
     ObSEArray<ObColumnSchemaV2, SEARRAY_INIT_NUM> resolved_cols;
+    ObSEArray<ObColumnSchemaV2, 8> ai_hidden_cols;
     // Resolve column names with the runtime name-case mode.
     //RESOLVE_NON_COL needs to add the columns in the query to stats in order to resolve PK constraint information etc.
     if (OB_FAIL(ret)) {
@@ -828,8 +829,40 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
             } else {
               ObColumnNameHashWrapper name_key(tmp_col->get_column_name_str());
               if (OB_FAIL(column_name_set_.set_refactored(name_key))) {
-              } else {
+              } else if (!tmp_col->is_ai_column()) {
                 ret = OB_SUCCESS;
+              } else {
+                uint64_t state_id = gen_column_id();
+                uint64_t request_id = gen_column_id();
+                uint64_t result_spec_id = gen_column_id();
+                tmp_col->set_ai_column_hidden_ids(state_id, request_id, result_spec_id);
+                for (int64_t hidden_idx = 0; OB_SUCC(ret) && hidden_idx < 3; ++hidden_idx) {
+                  const ObObjType hidden_type = (0 == hidden_idx) ? ObInt32Type : ObLongTextType;
+                  const char *hidden_suffix = (0 == hidden_idx) ? "status"
+                                             : (1 == hidden_idx ? "request" : "result_spec");
+                  ObSqlString hidden_name;
+                  ObColumnSchemaV2 hidden_col;
+                  if (OB_FAIL(hidden_name.append_fmt("__ai_%lu_%s",
+                              tmp_col->get_column_id(), hidden_suffix))) {
+                  } else if (OB_FAIL(hidden_col.set_column_name(hidden_name.string()))) {
+                  } else {
+                    hidden_col.set_column_id(0 == hidden_idx ? state_id
+                                            : (1 == hidden_idx ? request_id : result_spec_id));
+                    hidden_col.set_data_type(hidden_type);
+                    hidden_col.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[hidden_type]);
+                    hidden_col.set_nullable(true);
+                    hidden_col.set_is_hidden(true);
+                    hidden_col.set_charset_type(CHARSET_UTF8MB4);
+                    hidden_col.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+                    hidden_col.set_prev_column_id(UINT64_MAX);
+                    hidden_col.set_next_column_id(UINT64_MAX);
+                    if (OB_FAIL(ai_hidden_cols.push_back(hidden_col))) {
+                    } else {
+                      LOG_WARN("AI COLUMN hidden column prepared", K(hidden_name.string()),
+                               K(hidden_col.get_column_id()), K(hidden_type));
+                    }
+                  }
+                }
               }
             }
           }
@@ -885,6 +918,13 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
     }
 
     if (OB_SUCC(ret)) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < ai_hidden_cols.count(); ++i) {
+        if (OB_FAIL(resolved_cols.push_back(ai_hidden_cols.at(i)))) {
+        }
+      }
+    }
+
+    if (OB_SUCC(ret)) {
       for (int32_t i = resolved_cols_count; i < resolved_cols.count() && OB_SUCC(ret); i++) {
         ObColumnSchemaV2 &hidden_col = resolved_cols.at(i);
         if (OB_FAIL(table_schema.add_column(hidden_col))) {
@@ -894,6 +934,9 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
           }
         }
       }
+    }
+
+    if (OB_SUCC(ret) && OB_FAIL(ObDDLResolver::check_ai_column_dependencies(table_schema))) {
     }
 
     // A table must have at least one column as a visible column
