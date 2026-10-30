@@ -28,10 +28,31 @@ namespace oceanbase
 namespace sql
 {
 class ObTableModifyOp;
+
+// Row level events that may invalidate an asynchronous AI column.
+enum ObAiColumnTaskEvent : int64_t
+{
+  AI_COLUMN_TASK_INSERT = 0,
+  AI_COLUMN_TASK_UPDATE = 1,
+  AI_COLUMN_TASK_DELETE = 2,
+  AI_COLUMN_TASK_EVENT_MAX = 3,
+};
+
 class ObDMLService
 {
 public:
   static bool check_cascaded_reference(const ObExpr *expr, const ObExprPtrIArray &row);
+
+  // Maintains the asynchronous AI column task table for one changed row.  The
+  // tasks are written with the transaction of the current DML statement, so
+  // they commit and roll back together with the data change.
+  static int on_ai_column_row_change(ObExecContext &ctx,
+                                     ObEvalCtx &eval_ctx,
+                                     const ObDMLBaseCtDef &base_ctdef,
+                                     const ObDASDMLBaseRtDef &das_rtdef,
+                                     const common::ObTabletID &tablet_id,
+                                     const ObAiColumnTaskEvent event,
+                                     const common::ObIArray<uint64_t> *changed_column_ids);
 
   static int check_row_null(const ObExprPtrIArray &row,
                             ObEvalCtx &eval_ctx,

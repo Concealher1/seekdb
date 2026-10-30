@@ -45,6 +45,7 @@
 
 #include "observer/mysql/ob_diag.h"
 
+#include "observer/ob_ai_column_worker.h"
 #include "observer/omt/ob_server_runtime_controller.h"
 #include "observer/omt/ob_worker_processor.h"
 #include "data_plane/memtable/ob_lock_wait_service.h"
@@ -402,6 +403,8 @@ private:
   class StandbyHostAdapter;
 
   ObSignalHandle signal_handle_;
+  // Completes asynchronous AI column values in the background.
+  ObAiColumnWorker ai_column_worker_;
   // gctx, aka global context, stores pointers to objects or services
   // which should share with all, or in part, of classes using in
   // observer. The whole pointers stored in gctx wouldn't be changed

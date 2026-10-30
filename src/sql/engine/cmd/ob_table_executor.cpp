@@ -751,9 +751,35 @@ int ObAlterTableExecutor::alter_table_exchange_partition_rpc(obcall::ObExchangeP
   return ret;
 }
 
+int ObAlterTableExecutor::execute_ai_column_retry(ObAlterTableStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  common::ObMySQLProxy *sql_proxy = GCTX.sql_proxy_;
+  const common::ObString &sql = stmt.get_ai_column_retry_sql();
+  int64_t affected_rows = 0;
+  if (OB_ISNULL(sql_proxy)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_UNLIKELY(sql.empty())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(sql_proxy->write(sql.ptr(), affected_rows))) {
+    LOG_WARN("failed to execute ai column retry", KR(ret), K(sql));
+  } else {
+    LOG_INFO("ai column retry executed", K(affected_rows), K(sql));
+  }
+  return ret;
+}
+
 int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
 {
   int ret = OB_SUCCESS;
+  if (stmt.is_ai_column_retry()) {
+    // ALTER TABLE ... RETRY AI COLUMN is executed as one internal UPDATE, so
+    // the invalidation and the fresh task rows commit in the same transaction.
+    if (OB_FAIL(execute_ai_column_retry(stmt))) {
+      LOG_WARN("failed to execute ai column retry statement", KR(ret));
+    }
+    return ret;
+  }
   ObSqlExecutorCtx *task_exec_ctx = NULL;
   obcall::ObAlterTableArg &alter_table_arg = stmt.get_alter_table_arg();
   obcall::ObExchangePartitionArg &exchange_partition_arg = stmt.get_exchange_partition_arg();

@@ -1557,6 +1557,8 @@ private:
       const common::hash::ObHashMap<uint64_t, uint64_t> &column_id_map);
   int convert_column_udt_set_ids(
       const common::hash::ObHashMap<uint64_t, uint64_t> &column_id_map);
+  int convert_ai_column_hidden_ids(
+      const common::hash::ObHashMap<uint64_t, uint64_t> &column_id_map);
   int convert_geo_generated_col_ids(
       const common::hash::ObHashMap<uint64_t, uint64_t> &column_id_map);
   static int convert_column_ids_in_info(

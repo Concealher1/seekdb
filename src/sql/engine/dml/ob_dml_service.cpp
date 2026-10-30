@@ -34,6 +34,10 @@
 #include "sql/engine/ob_batch_rows.h"
 #include "sql/engine/ob_physical_plan.h"
 #include "query/vector/ob_vector_index_util.h"
+#include "share/schema/ob_schema_utils.h"
+#include "storage/tx/ob_trans_define_v4.h"
+#include "data_plane/blocksstable/ob_datum_row.h"
+#include "data_plane/blocksstable/ob_datum_row_iterator.h"
 namespace oceanbase
 {
 using namespace common;
@@ -2381,6 +2385,641 @@ int ObDMLService::get_root_exec_ctx_for_fk_cascading(ObExecContext *ctx, ObExecC
   }
   return ret;
 }
+
+// ---------------------------------------------------------------------------
+// Asynchronous AI column task maintenance.
+//
+// An AI column keeps its value in the table but the value is produced later by
+// an asynchronous worker.  Every row change that touches the columns an AI
+// column depends on has to (1) invalidate the cached value and (2) enqueue one
+// task row per AI column.  The task rows live in __all_ai_column_task and are
+// written through the transaction of the data change, so they are only visible
+// to other sessions once the data change commits.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+// The AI column description is stored in __all_ai_column.  It is read on demand
+// because a table schema does not carry its AI columns yet.
+struct ObAiColumnMeta
+{
+  ObAiColumnMeta()
+    : column_id_(OB_INVALID_ID),
+      column_name_(),
+      function_name_(),
+      model_name_(),
+      dependencies_(),
+      sync_mode_(),
+      max_retries_(0)
+  {}
+  uint64_t column_id_;
+  ObString column_name_;
+  ObString function_name_;
+  ObString model_name_;
+  ObString dependencies_;
+  ObString sync_mode_;
+  int64_t max_retries_;
+};
+
+int ai_column_copy_string(ObIAllocator &allocator, const ObString &src, ObString &dst)
+{
+  int ret = OB_SUCCESS;
+  char *buf = NULL;
+  if (src.empty()) {
+    dst.reset();
+  } else if (OB_ISNULL(buf = static_cast<char *>(allocator.alloc(src.length())))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    MEMCPY(buf, src.ptr(), src.length());
+    dst.assign_ptr(buf, src.length());
+  }
+  return ret;
+}
+
+int ai_column_fetch_metadata(ObExecContext &ctx,
+                             ObIAllocator &allocator,
+                             const uint64_t table_id,
+                             ObIArray<ObAiColumnMeta> &metas)
+{
+  int ret = OB_SUCCESS;
+  ObMySQLProxy *sql_proxy = ctx.get_sql_proxy();
+  ObSqlString sql;
+  if (OB_ISNULL(sql_proxy)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sql proxy is null", KR(ret));
+  } else if (OB_FAIL(sql.append_fmt(
+                 "SELECT column_id, column_name, function_name, model_name, dependencies, "
+                 "sync_mode, max_retries FROM %s WHERE table_id = %lu",
+                 OB_ALL_AI_COLUMN_TNAME, table_id))) {
+    LOG_WARN("failed to build ai column metadata sql", KR(ret));
+  } else {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      sqlclient::ObMySQLResult *result = NULL;
+      if (OB_FAIL(sql_proxy->read(res, sql.ptr()))) {
+        LOG_WARN("failed to read ai column metadata", KR(ret), K(sql));
+      } else if (OB_ISNULL(result = res.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+      }
+      while (OB_SUCC(ret) && OB_SUCC(result->next())) {
+        ObAiColumnMeta meta;
+        ObString column_name;
+        ObString function_name;
+        ObString model_name;
+        ObString dependencies;
+        ObString sync_mode;
+        int64_t column_id = 0;
+        int64_t max_retries = 0;
+        EXTRACT_INT_FIELD_MYSQL(*result, "column_id", column_id, int64_t);
+        EXTRACT_VARCHAR_FIELD_MYSQL(*result, "column_name", column_name);
+        EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(*result, "function_name", function_name,
+                                                       true, true, ObString());
+        EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(*result, "model_name", model_name,
+                                                       true, true, ObString());
+        EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(*result, "dependencies", dependencies,
+                                                       true, true, ObString());
+        EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(*result, "sync_mode", sync_mode,
+                                                       true, true, ObString("async"));
+        EXTRACT_INT_FIELD_MYSQL(*result, "max_retries", max_retries, int64_t);
+        if (OB_FAIL(ret)) {
+        } else if (FALSE_IT(meta.column_id_ = static_cast<uint64_t>(column_id))) {
+        } else if (OB_FAIL(ai_column_copy_string(allocator, column_name, meta.column_name_))) {
+        } else if (OB_FAIL(ai_column_copy_string(allocator, function_name, meta.function_name_))) {
+        } else if (OB_FAIL(ai_column_copy_string(allocator, model_name, meta.model_name_))) {
+        } else if (OB_FAIL(ai_column_copy_string(allocator, dependencies, meta.dependencies_))) {
+        } else if (OB_FAIL(ai_column_copy_string(allocator, sync_mode, meta.sync_mode_))) {
+        } else if (FALSE_IT(meta.max_retries_ = max_retries)) {
+        } else if (OB_FAIL(metas.push_back(meta))) {
+          LOG_WARN("failed to push ai column metadata", KR(ret));
+        }
+      }
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+      }
+    }
+  }
+  return ret;
+}
+
+// An AI column has to be invalidated when one of the columns referenced by its
+// expression is assigned, or when the primary key of the row is rewritten.
+bool ai_column_is_affected(const ObAiColumnMeta &ai_column,
+                           const ObTableSchema &table_schema,
+                           const ObIArray<uint64_t> &changed_column_ids)
+{
+  bool affected = false;
+  const ObString &deps = ai_column.dependencies_;
+  int32_t start = 0;
+  while (!affected && start < deps.length()) {
+    int32_t end = start;
+    while (end < deps.length() && ',' != deps[end]) {
+      ++end;
+    }
+    ObString dep_name(end - start, deps.ptr() + start);
+    dep_name = dep_name.trim();
+    if (!dep_name.empty()) {
+      const ObColumnSchemaV2 *dep_column = table_schema.get_column_schema(dep_name);
+      if (NULL != dep_column
+          && has_exist_in_array(changed_column_ids, dep_column->get_column_id())) {
+        affected = true;
+      }
+    }
+    start = end + 1;
+  }
+  if (!affected) {
+    // A retry marks the row by touching the hidden request column of the AI
+    // column; that marker is what schedules a fresh task.  Publishing a value
+    // or maintaining the state column must not re-schedule by itself.
+    char request_name[64];
+    int64_t request_pos = 0;
+    if (OB_SUCCESS == databuff_printf(request_name, sizeof(request_name), request_pos,
+                                      "__ai_%lu_request", ai_column.column_id_)) {
+      const ObColumnSchemaV2 *request_column = table_schema.get_column_schema(request_name);
+      if (NULL != request_column
+          && has_exist_in_array(changed_column_ids, request_column->get_column_id())) {
+        affected = true;
+      }
+    }
+  }
+  if (!affected) {
+    const ObRowkeyInfo &rowkey_info = table_schema.get_rowkey_info();
+    for (int64_t i = 0; !affected && i < rowkey_info.get_size(); ++i) {
+      const ObRowkeyColumn *rowkey_column = rowkey_info.get_column(i);
+      if (NULL != rowkey_column
+          && has_exist_in_array(changed_column_ids, rowkey_column->column_id_)) {
+        affected = true;
+      }
+    }
+  }
+  return affected;
+}
+
+// Builds the SQL predicate that identifies the row, e.g. "`id` = 2".  The
+// worker uses it to read the affected row back without depending on the schema
+// version of the table.
+int ai_column_build_rowkey_predicate(const ObTableSchema &table_schema,
+                                     const ExprFixedArray &row,
+                                     const int64_t rowkey_cnt,
+                                     ObEvalCtx &eval_ctx,
+                                     ObSqlString &predicate,
+                                     bool &supported)
+{
+  int ret = OB_SUCCESS;
+  supported = true;
+  const ObRowkeyInfo &rowkey_info = table_schema.get_rowkey_info();
+  for (int64_t i = 0; OB_SUCC(ret) && supported && i < rowkey_cnt; ++i) {
+    const ObRowkeyColumn *rowkey_column = rowkey_info.get_column(i);
+    const ObColumnSchemaV2 *column = NULL;
+    ObDatum *datum = NULL;
+    ObObj obj;
+    char literal[1024];
+    int64_t literal_pos = 0;
+    if (i >= row.count() || OB_ISNULL(rowkey_column)) {
+      supported = false;
+    } else if (OB_ISNULL(column = table_schema.get_column_schema(rowkey_column->column_id_))) {
+      supported = false;
+    } else if (column->is_hidden()) {
+      // A hidden primary key (table without primary key) cannot be written as
+      // a SQL predicate.
+      supported = false;
+    } else if (OB_FAIL(row.at(i)->eval(eval_ctx, datum)) || OB_ISNULL(datum)) {
+      if (OB_SUCC(ret)) {
+        ret = OB_ERR_UNEXPECTED;
+      }
+      LOG_WARN("failed to evaluate rowkey expr", KR(ret));
+    } else if (OB_FAIL(datum->to_obj(obj, row.at(i)->obj_meta_))) {
+      LOG_WARN("failed to convert rowkey datum to obj", KR(ret));
+    } else if (OB_FAIL(obj.print_sql_literal(literal, sizeof(literal), literal_pos))) {
+      LOG_WARN("failed to print rowkey literal", KR(ret), K(obj));
+    } else if (OB_FAIL(predicate.append_fmt("%s`%.*s` = %.*s",
+                                            0 == i ? "" : " AND ",
+                                            column->get_column_name_str().length(),
+                                            column->get_column_name(),
+                                            static_cast<int32_t>(literal_pos),
+                                            literal))) {
+      LOG_WARN("failed to append rowkey predicate", KR(ret));
+    }
+  }
+  return ret;
+}
+
+// Writes rows of the AI column task table inside the transaction of the
+// current statement.
+class ObAiColumnTaskWriter
+{
+public:
+  explicit ObAiColumnTaskWriter(common::ObIAllocator &alloc)
+    : alloc_(alloc),
+      plan_(alloc),
+      column_ids_(),
+      tx_desc_(NULL),
+      dml_service_(NULL),
+      write_context_(),
+      execution_()
+  {}
+  int init(ObExecContext &ctx,
+           const ObTableSchema &task_schema,
+           const int64_t timeout_ts,
+           const ObSQLMode sql_mode);
+  int insert_task(const ObTableSchema &task_schema,
+                  const ObAiColumnMeta &ai_column,
+                  const ObSqlString &predicate,
+                  const common::ObTabletID &tablet_id,
+                  const uint64_t data_table_id,
+                  const int64_t request_id);
+  int delete_task(const ObTableSchema &task_schema,
+                  const ObAiColumnMeta &ai_column,
+                  const ObSqlString &predicate,
+                  const uint64_t data_table_id);
+private:
+  int fill_and_write(const ObTableSchema &task_schema,
+                     const ObAiColumnMeta *ai_column,
+                     const ObSqlString &predicate,
+                     const common::ObTabletID *tablet_id,
+                     const uint64_t data_table_id,
+                     const int64_t request_id,
+                     const bool is_insert);
+private:
+  common::ObIAllocator &alloc_;
+  data_plane::ObDmlTablePlan plan_;
+  common::ObSEArray<uint64_t, 16> column_ids_;
+  transaction::ObTxDesc *tx_desc_;
+  data_plane::ObIDmlService *dml_service_;
+  data_plane::ObWriteContext write_context_;
+  data_plane::ObDmlExecution execution_;
+};
+
+int ObAiColumnTaskWriter::init(ObExecContext &ctx,
+                               const ObTableSchema &task_schema,
+                               const int64_t timeout_ts,
+                               const ObSQLMode sql_mode)
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session = ctx.get_my_session();
+  ObSqlCtx *sql_ctx = ctx.get_sql_ctx();
+  ObSchemaGetterGuard *guard = NULL == sql_ctx ? NULL : sql_ctx->schema_guard_;
+  transaction::ObTxDesc *tx_desc = NULL;
+  int64_t schema_version = OB_INVALID_VERSION;
+  data_plane::ObIWriteContextService *write_context_service =
+      share::server_service<data_plane::ObIWriteContextService>();
+  transaction::ObTxReadSnapshot &snapshot = ctx.get_das_ctx().get_snapshot();
+  if (OB_ISNULL(session) || OB_ISNULL(guard) || OB_ISNULL(write_context_service)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai column task writer is not available", KR(ret), KP(session), KP(guard));
+  } else if (OB_ISNULL(dml_service_ = share::server_service<data_plane::ObIDmlService>())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("dml service is not available", KR(ret));
+  } else if (OB_ISNULL(tx_desc = session->get_tx_desc()) || !tx_desc->is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai column task maintenance requires an active transaction", KR(ret));
+  } else if (OB_FAIL(guard->get_schema_version(schema_version))) {
+    LOG_WARN("failed to get schema version", KR(ret));
+  } else {
+    // Row datums are addressed by column_ids_ order and the storage layer expects
+    // the rowkey columns first, exactly like a DAS row write plan.
+    const ObRowkeyInfo &rowkey_info = task_schema.get_rowkey_info();
+    for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_info.get_size(); ++i) {
+      const ObRowkeyColumn *rowkey_column = rowkey_info.get_column(i);
+      if (OB_ISNULL(rowkey_column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(column_ids_.push_back(rowkey_column->column_id_))) {
+        LOG_WARN("failed to push task rowkey column id", KR(ret));
+      }
+    }
+    for (ObTableSchema::const_column_iterator iter = task_schema.column_begin();
+         OB_SUCC(ret) && iter != task_schema.column_end(); ++iter) {
+      if (OB_ISNULL(*iter)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if ((*iter)->is_rowkey_column()) {
+        // already pushed above
+      } else if (OB_FAIL(column_ids_.push_back((*iter)->get_column_id()))) {
+        LOG_WARN("failed to push task column id", KR(ret));
+      }
+    }
+    concurrent_control::ObWriteFlag write_flag;
+    data_plane::ObDmlWriteSpec write_spec;
+    write_spec.timeout_ = timeout_ts;
+    // storage validates the write against the schema version of the table
+    write_spec.schema_version_ = task_schema.get_schema_version();
+    write_spec.sql_mode_ = sql_mode;
+    write_spec.tz_info_ = session->get_tz_info_wrap().get_time_zone_info();
+    write_spec.branch_id_ = 0;
+    // Task rows are written from the row level DML hook, which never scanned the
+    // task table.  Dropping a task that is already gone is legal, so the storage
+    // level old-row legitimacy check must not run for these internal writes.
+    write_spec.is_main_table_in_fts_ddl_ = true;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(plan_.build(&task_schema, schema_version, column_ids_))) {
+      LOG_WARN("failed to build task table plan", KR(ret));
+    } else if (OB_FAIL(plan_.set_data_table_rowkey_tags(guard, &task_schema))) {
+      LOG_WARN("failed to set rowkey tags for task table", KR(ret));
+    } else if (OB_FAIL(write_context_service->acquire_write_context(timeout_ts,
+                                                                    *tx_desc,
+                                                                    snapshot,
+                                                                    0,
+                                                                    write_flag,
+                                                                    write_context_))) {
+      LOG_WARN("failed to acquire write context", KR(ret));
+    } else if (OB_FAIL(dml_service_->prepare_execution(write_spec,
+                                                       plan_,
+                                                       snapshot,
+                                                       alloc_,
+                                                       write_context_,
+                                                       write_flag,
+                                                       execution_))) {
+      LOG_WARN("failed to prepare task write execution", KR(ret));
+    } else {
+      tx_desc_ = tx_desc;
+    }
+  }
+  return ret;
+}
+
+int ObAiColumnTaskWriter::fill_and_write(const ObTableSchema &task_schema,
+                                         const ObAiColumnMeta *ai_column,
+                                         const ObSqlString &predicate,
+                                         const common::ObTabletID *tablet_id,
+                                         const uint64_t data_table_id,
+                                         const int64_t request_id,
+                                         const bool is_insert)
+{
+  int ret = OB_SUCCESS;
+  blocksstable::ObDatumRow row;
+  const int64_t now = ObTimeUtility::current_time();
+  if (OB_ISNULL(tx_desc_) || OB_ISNULL(dml_service_) || column_ids_.empty()) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ai column task writer is not inited", KR(ret));
+  } else if (OB_FAIL(row.init(alloc_, column_ids_.count()))) {
+    LOG_WARN("failed to init task datum row", KR(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_ids_.count(); ++i) {
+    const ObColumnSchemaV2 *column = task_schema.get_column_schema(column_ids_.at(i));
+    blocksstable::ObStorageDatum &datum = row.storage_datums_[i];
+    if (OB_ISNULL(column)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("null task column", KR(ret), K(column_ids_.at(i)));
+    } else {
+      const ObString &name = column->get_column_name_str();
+      datum.set_null();
+      if (0 == name.case_compare("table_id")) {
+        // stored the same way __all_table exposes it to SQL
+        datum.set_int(static_cast<int64_t>(
+            ObSchemaUtils::get_extract_schema_id(data_table_id)));
+      } else if (0 == name.case_compare("rowkey_predicate")) {
+        datum.set_string(predicate.ptr(), static_cast<uint32_t>(predicate.length()));
+      } else if (0 == name.case_compare("column_id")) {
+        if (NULL != ai_column) {
+          datum.set_int(static_cast<int64_t>(ai_column->column_id_));
+        }
+      } else if (0 == name.case_compare("tablet_id")) {
+        if (NULL != tablet_id) {
+          datum.set_int(static_cast<int64_t>(tablet_id->id()));
+        }
+      } else if (0 == name.case_compare("column_name")) {
+        if (NULL != ai_column) {
+          datum.set_string(ai_column->column_name_);
+        }
+      } else if (0 == name.case_compare("function_name")) {
+        if (NULL != ai_column) {
+          datum.set_string(ai_column->function_name_);
+        }
+      } else if (0 == name.case_compare("model_name")) {
+        if (NULL != ai_column) {
+          datum.set_string(ai_column->model_name_);
+        }
+      } else if (0 == name.case_compare("sync_mode")) {
+        if (NULL != ai_column) {
+          datum.set_string(ai_column->sync_mode_);
+        }
+      } else if (0 == name.case_compare("request_id")) {
+        datum.set_int(request_id);
+      } else if (0 == name.case_compare("state")) {
+        datum.set_int(0);
+      } else if (0 == name.case_compare("retry_count")) {
+        datum.set_int(0);
+      } else if (0 == name.case_compare("eligible_ts")
+                 || 0 == name.case_compare("gmt_create")
+                 || 0 == name.case_compare("gmt_modified")) {
+        datum.set_timestamp(now);
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    blocksstable::ObSingleDatumRowIteratorWrapper row_iter(&row);
+    int64_t affected_rows = 0;
+    common::ObTabletID task_tablet_id = task_schema.get_tablet_id();
+    if (!task_tablet_id.is_valid()) {
+      task_tablet_id = common::ObTabletID(task_schema.get_table_id());
+    }
+    if (is_insert) {
+      row.row_flag_.set_flag(blocksstable::DF_INSERT);
+      if (OB_FAIL(dml_service_->insert_rows(task_tablet_id,
+                                            *tx_desc_,
+                                            execution_,
+                                            column_ids_,
+                                            &row_iter,
+                                            affected_rows))) {
+        LOG_WARN("failed to insert ai column task", KR(ret), K(predicate));
+      } else {
+      }
+    } else {
+      row.row_flag_.set_flag(blocksstable::DF_DELETE);
+      if (OB_FAIL(dml_service_->delete_rows(task_tablet_id,
+                                            *tx_desc_,
+                                            execution_,
+                                            column_ids_,
+                                            &row_iter,
+                                            affected_rows))) {
+        LOG_WARN("failed to delete ai column task", KR(ret), K(predicate));
+      } else {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObAiColumnTaskWriter::insert_task(const ObTableSchema &task_schema,
+                                      const ObAiColumnMeta &ai_column,
+                                      const ObSqlString &predicate,
+                                      const common::ObTabletID &tablet_id,
+                                      const uint64_t data_table_id,
+                                      const int64_t request_id)
+{
+  return fill_and_write(task_schema, &ai_column, predicate, &tablet_id,
+                        data_table_id, request_id, true);
+}
+
+int ObAiColumnTaskWriter::delete_task(const ObTableSchema &task_schema,
+                                      const ObAiColumnMeta &ai_column,
+                                      const ObSqlString &predicate,
+                                      const uint64_t data_table_id)
+{
+  return fill_and_write(task_schema, &ai_column, predicate, NULL,
+                        data_table_id, 0, false);
+}
+
+// Returns the data table schema, or NULL when the table is not visible to this
+// statement (for example a dropped table or a system table).  AI columns only
+// exist on user tables, so an unresolvable table simply has no work to do.
+int ai_column_get_schemas(ObSchemaGetterGuard &guard,
+                          const uint64_t table_id,
+                          const ObTableSchema *&data_schema,
+                          const ObTableSchema *&task_schema)
+{
+  int ret = OB_SUCCESS;
+  data_schema = NULL;
+  task_schema = NULL;
+  if (OB_UNLIKELY(OB_INVALID_ID == table_id)) {
+    LOG_TRACE("skip ai column maintenance for invalid table id", K(table_id));
+  } else if (OB_FAIL(guard.get_table_schema(table_id, data_schema))) {
+    if (OB_SCHEMA_ERROR == ret || OB_TABLE_NOT_EXIST == ret) {
+      LOG_TRACE("table is not visible, skip ai column maintenance", K(ret), K(table_id));
+      ret = OB_SUCCESS;
+      data_schema = NULL;
+    } else {
+      LOG_WARN("failed to get data table schema", KR(ret), K(table_id));
+    }
+  } else if (OB_ISNULL(data_schema)) {
+    LOG_TRACE("table is not visible, skip ai column maintenance", K(table_id));
+  } else if (OB_FAIL(guard.get_table_schema(OB_ALL_AI_COLUMN_TASK_TID, task_schema))
+             || OB_ISNULL(task_schema)) {
+    if (OB_SUCC(ret)) {
+      ret = OB_SCHEMA_ERROR;
+    }
+    LOG_WARN("failed to get ai column task schema", KR(ret));
+  }
+  return ret;
+}
+
+} // anonymous namespace
+
+int ObDMLService::on_ai_column_row_change(ObExecContext &ctx,
+                                          ObEvalCtx &eval_ctx,
+                                          const ObDMLBaseCtDef &base_ctdef,
+                                          const ObDASDMLBaseRtDef &das_rtdef,
+                                          const common::ObTabletID &tablet_id,
+                                          const ObAiColumnTaskEvent event,
+                                          const common::ObIArray<uint64_t> *changed_column_ids)
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session = ctx.get_my_session();
+  ObSqlCtx *sql_ctx = ctx.get_sql_ctx();
+  ObSchemaGetterGuard *guard = NULL == sql_ctx ? NULL : sql_ctx->schema_guard_;
+  const ObTableSchema *data_schema = NULL;
+  const ObTableSchema *task_schema = NULL;
+  ObSEArray<ObAiColumnMeta, 4> ai_columns;
+  ObSEArray<ObAiColumnMeta, 4> affected_columns;
+  ObSqlString old_predicate;
+  ObSqlString new_predicate;
+  bool supported = true;
+  LOG_TRACE("ai column row change", K(event), K(base_ctdef.das_base_ctdef_.index_tid_),
+            K(base_ctdef.das_base_ctdef_.rowkey_cnt_));
+  if (OB_ISNULL(session) || OB_ISNULL(guard)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("no schema guard for ai column task maintenance", KR(ret));
+  } else if (is_inner_table(base_ctdef.das_base_ctdef_.index_tid_)) {
+    // system tables never contain AI columns
+  } else if (OB_UNLIKELY(base_ctdef.das_base_ctdef_.rowkey_cnt_ <= 0)) {
+    // rows of this table cannot be addressed by a predicate
+  } else if (OB_FAIL(ai_column_get_schemas(*guard, base_ctdef.das_base_ctdef_.index_tid_,
+                                           data_schema, task_schema))) {
+  } else if (NULL == data_schema || NULL == task_schema) {
+    // table is not visible, nothing to maintain
+  } else if (!data_schema->is_user_table()) {
+    // AI columns only exist on user tables
+  } else if (OB_FAIL(ai_column_fetch_metadata(ctx, ctx.get_allocator(),
+                                              data_schema->get_table_id(), ai_columns))) {
+    LOG_WARN("failed to read ai column metadata", KR(ret));
+  } else if (ai_columns.empty()) {
+    // table without AI columns
+  } else {
+    const int64_t rowkey_cnt = base_ctdef.das_base_ctdef_.rowkey_cnt_;
+    const uint64_t data_table_id = data_schema->get_table_id();
+    if (AI_COLUMN_TASK_INSERT == event) {
+      if (OB_FAIL(ai_column_build_rowkey_predicate(*data_schema,
+                                                   base_ctdef.new_row_,
+                                                   rowkey_cnt,
+                                                   eval_ctx,
+                                                   new_predicate,
+                                                   supported))) {
+        LOG_WARN("failed to build rowkey predicate", KR(ret));
+      } else if (!supported) {
+      } else if (OB_FAIL(affected_columns.assign(ai_columns))) {
+        LOG_WARN("failed to assign ai columns", KR(ret));
+      }
+    } else if (AI_COLUMN_TASK_UPDATE == event) {
+      if (OB_ISNULL(changed_column_ids)) {
+        ret = OB_INVALID_ARGUMENT;
+      } else if (OB_FAIL(ai_column_build_rowkey_predicate(*data_schema,
+                                                          base_ctdef.old_row_,
+                                                          rowkey_cnt,
+                                                          eval_ctx,
+                                                          old_predicate,
+                                                          supported))) {
+        LOG_WARN("failed to build old rowkey predicate", KR(ret));
+      } else if (!supported) {
+      } else if (OB_FAIL(ai_column_build_rowkey_predicate(*data_schema,
+                                                          base_ctdef.new_row_,
+                                                          rowkey_cnt,
+                                                          eval_ctx,
+                                                          new_predicate,
+                                                          supported))) {
+        LOG_WARN("failed to build new rowkey predicate", KR(ret));
+      } else if (!supported) {
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < ai_columns.count(); ++i) {
+          if (ai_column_is_affected(ai_columns.at(i), *data_schema, *changed_column_ids)
+              && OB_FAIL(affected_columns.push_back(ai_columns.at(i)))) {
+            LOG_WARN("failed to collect affected ai column", KR(ret));
+          }
+        }
+      }
+      // The cached value itself is invalidated by the implicit assignment
+      // that the update resolver adds for the affected AI columns.
+    } else if (AI_COLUMN_TASK_DELETE == event) {
+      if (OB_FAIL(ai_column_build_rowkey_predicate(*data_schema,
+                                                   base_ctdef.old_row_,
+                                                   rowkey_cnt,
+                                                   eval_ctx,
+                                                   new_predicate,
+                                                   supported))) {
+        LOG_WARN("failed to build rowkey predicate", KR(ret));
+      } else if (!supported) {
+      } else if (OB_FAIL(affected_columns.assign(ai_columns))) {
+        LOG_WARN("failed to assign ai columns", KR(ret));
+      }
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+    }
+
+    if (OB_SUCC(ret) && !affected_columns.empty()) {
+      ObAiColumnTaskWriter writer(ctx.get_allocator());
+      const int64_t request_id = ObTimeUtility::current_time();
+      if (OB_FAIL(writer.init(ctx, *task_schema, das_rtdef.timeout_ts_, das_rtdef.sql_mode_))) {
+        LOG_WARN("failed to init ai column task writer", KR(ret));
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < affected_columns.count(); ++i) {
+          const ObAiColumnMeta &ai_column = affected_columns.at(i);
+          if (AI_COLUMN_TASK_UPDATE == event
+              && OB_FAIL(writer.delete_task(*task_schema, ai_column, old_predicate,
+                                            data_table_id))) {
+            LOG_WARN("failed to drop stale ai column task", KR(ret));
+          } else if (OB_FAIL(writer.delete_task(*task_schema, ai_column, new_predicate,
+                                                data_table_id))) {
+            LOG_WARN("failed to drop stale ai column task", KR(ret));
+          } else if (AI_COLUMN_TASK_DELETE == event) {
+            // delete only needs the cleanup above
+          } else if (OB_FAIL(writer.insert_task(*task_schema, ai_column, new_predicate,
+                                                tablet_id, data_table_id, request_id))) {
+            LOG_WARN("failed to insert ai column task", KR(ret));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 
 }  // namespace sql
 }  // namespace oceanbase

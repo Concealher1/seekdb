@@ -2475,6 +2475,37 @@ all_ai_column_def = dict(
 )
 def_table_schema(**all_ai_column_def)
 
+# Pending asynchronous AI column work, one row per (row change, AI column).
+# The rowkey predicate is part of the primary key so that the worker can
+# rebuild the affected row key without depending on the table schema.
+all_ai_column_task_def = dict(
+    owner = 'seekdb',
+    table_name = '__all_ai_column_task',
+    table_id = '1132',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+      ('table_id', 'int'),
+      ('rowkey_predicate', 'varchar:512'),
+      ('column_id', 'int')
+    ],
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        ('tablet_id', 'int', 'false', -1),
+        ('column_name', 'varchar:OB_MAX_COLUMN_NAME_LENGTH', 'false'),
+        ('function_name', 'varchar:64', 'true'),
+        ('model_name', 'varchar:128', 'true'),
+        ('sync_mode', 'varchar:16', 'false', 'async'),
+        ('request_id', 'int', 'false', 0),
+        ('state', 'int', 'false', 0),
+        ('retry_count', 'int', 'false', 0),
+        ('eligible_ts', 'timestamp:6', 'true'),
+        ('last_error', 'varchar:OB_MAX_ERROR_MSG_LEN', 'true')
+    ]
+)
+def_table_schema(**all_ai_column_task_def)
+
 
 all_objauth_mysql_def = dict(
     owner = 'cjl476581',

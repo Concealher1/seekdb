@@ -248,6 +248,9 @@ OB_INLINE int ObTableDeleteOp::delete_row_to_das()
         break;
       } else if (OB_FAIL(calc_tablet_loc(del_ctdef, del_rtdef, tablet_loc))) {
       } else if (OB_FAIL(ObDMLService::delete_row(del_ctdef, del_rtdef, tablet_loc, dml_rtctx_, modify_row.old_row_))) {
+      } else if (0 == j && OB_FAIL(ObDMLService::on_ai_column_row_change(
+                     ctx_, eval_ctx_, del_ctdef, del_rtdef.das_rtdef_,
+                     tablet_loc->tablet_id_, AI_COLUMN_TASK_DELETE, NULL))) {
       } else if (need_after_row_process(del_ctdef) && OB_FAIL(dml_modify_rows_.push_back(modify_row))) {
       } else {
         ++del_rtdef.cur_row_num_;

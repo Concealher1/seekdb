@@ -3523,7 +3523,8 @@ int ObDDLResolver::resolve_ai_column(ObColumnSchemaV2 &column, ParseNode *ai_nod
       } else if (is_embed && EndpointType::DENSE_EMBEDDING != model_schema->get_type()) {
         ret = OB_INVALID_ARGUMENT;
         LOG_USER_ERROR(OB_INVALID_ARGUMENT, "AI_EMBED requires a dense embedding model");
-      } else if (is_complete && !column.is_string_type() && !column.is_json()) {
+      } else if (is_complete && !column.is_string_type() && !column.is_json()
+                 && !ob_is_integer_type(column.get_data_type())) {
         ret = OB_NOT_SUPPORTED;
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_COMPLETE column type");
       } else if (is_embed && !column.is_collection()) {

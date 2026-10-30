@@ -30,6 +30,8 @@
 #include "sql/das/iter/ob_das_iter_utils.h"
 #include "sql/engine/px/ob_granule_iterator_op.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
+#include "common/mysqlclient/ob_mysql_result.h"
+#include "share/schema/ob_schema_getter_guard.h"
 
 namespace oceanbase
 {
@@ -1426,6 +1428,149 @@ int ObTableScanOp::set_need_check_outrow_lob()
   return ret;
 }
 
+
+namespace
+{
+
+// Same identification as the DML resolver: the persisted hidden state column
+// survives schema reloads, the in-memory AI column flag does not.
+bool ai_strict_is_ai_column(const share::schema::ObTableSchema &table_schema,
+                            const share::schema::ObColumnSchemaV2 &column)
+{
+  bool is_ai = column.is_ai_column();
+  if (!is_ai) {
+    char hidden_name[64];
+    int64_t pos = 0;
+    if (OB_SUCCESS == databuff_printf(hidden_name, sizeof(hidden_name), pos,
+                                      "__ai_%lu_status", column.get_column_id())) {
+      const share::schema::ObColumnSchemaV2 *hidden =
+          table_schema.get_column_schema(hidden_name);
+      is_ai = (NULL != hidden && hidden->is_hidden());
+    }
+  }
+  return is_ai;
+}
+
+int ai_strict_append_identifier(const common::ObString &name, common::ObSqlString &sql)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(sql.append("`"))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < name.length(); ++i) {
+      if ('`' == name.ptr()[i]) {
+        ret = sql.append("``");
+      } else {
+        ret = sql.append(name.ptr() + i, 1);
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ret = sql.append("`");
+    }
+  }
+  return ret;
+}
+
+// A strict read requires every row of the referenced AI column to be READY.
+// The check is column wide, so it is a single COUNT over the table and it runs
+// before the scan produces any row (a DML statement therefore fails before it
+// changes anything).
+int ai_strict_check_column(ObExecContext &ctx,
+                           const share::schema::ObTableSchema &table_schema,
+                           const share::schema::ObDatabaseSchema &database_schema,
+                           const share::schema::ObColumnSchemaV2 &column)
+{
+  int ret = OB_SUCCESS;
+  common::ObSqlString sql;
+  char status_buf[64];
+  int64_t status_pos = 0;
+  int64_t not_ready = 0;
+  if (OB_FAIL(databuff_printf(status_buf, sizeof(status_buf), status_pos,
+                              "__ai_%lu_status", column.get_column_id()))) {
+  } else if (OB_FAIL(sql.append("SELECT COUNT(*) AS not_ready FROM "))) {
+  } else if (OB_FAIL(ai_strict_append_identifier(database_schema.get_database_name_str(), sql))) {
+  } else if (OB_FAIL(sql.append("."))) {
+  } else if (OB_FAIL(ai_strict_append_identifier(table_schema.get_table_name_str(), sql))) {
+  } else if (OB_FAIL(sql.append(" WHERE "))) {
+  } else if (OB_FAIL(ai_strict_append_identifier(
+                 common::ObString(static_cast<int32_t>(status_pos), status_buf), sql))) {
+  } else if (OB_FAIL(sql.append(" IS NULL OR "))) {
+  } else if (OB_FAIL(ai_strict_append_identifier(
+                 common::ObString(static_cast<int32_t>(status_pos), status_buf), sql))) {
+  } else if (OB_FAIL(sql.append(" <> 4 OR "))) {
+  } else if (OB_FAIL(ai_strict_append_identifier(column.get_column_name_str(), sql))) {
+  } else if (OB_FAIL(sql.append(" IS NULL"))) {
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_NOT_INIT;
+  } else {
+    SMART_VAR(common::ObISQLClient::ReadResult, res) {
+      common::sqlclient::ObMySQLResult *result = NULL;
+      if (OB_FAIL(GCTX.sql_proxy_->read(res, sql.ptr()))) {
+        LOG_WARN("failed to check ai column strict read", KR(ret), K(sql));
+      } else if (OB_ISNULL(result = res.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        const int next_ret = result->next();
+        if (OB_SUCCESS != next_ret) {
+          ret = OB_ITER_END == next_ret ? OB_ERR_UNEXPECTED : next_ret;
+        } else {
+          EXTRACT_INT_FIELD_MYSQL(*result, "not_ready", not_ready, int64_t);
+        }
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (not_ready > 0) {
+    ret = OB_AI_COLUMN_UNFINISHED_TASK;
+    LOG_USER_ERROR(OB_AI_COLUMN_UNFINISHED_TASK,
+                   table_schema.get_table_id(), column.get_column_id());
+  }
+  return ret;
+}
+
+int ai_strict_check_table_scan(ObExecContext &ctx, const ObTableScanSpec &spec)
+{
+  int ret = OB_SUCCESS;
+  bool strict = false;
+  ObSQLSessionInfo *session = GET_MY_SESSION(ctx);
+  const uint64_t table_id = spec.get_ref_table_id();
+  ObSchemaGetterGuard *guard = NULL;
+  const share::schema::ObTableSchema *table_schema = NULL;
+  const share::schema::ObDatabaseSchema *database_schema = NULL;
+  if (OB_ISNULL(session)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_SUCCESS != session->get_ai_column_strict_read(strict) || !strict) {
+    // strict reads are opt-in per session; keep the normal path free
+  } else if (is_inner_table(table_id)) {
+  } else if (OB_ISNULL(ctx.get_sql_ctx()) || OB_ISNULL(guard = ctx.get_sql_ctx()->schema_guard_)) {
+    // no schema guard (for example a virtual table scan): nothing to check
+  } else if (OB_FAIL(guard->get_table_schema(table_id, table_schema))) {
+    if (OB_TABLE_NOT_EXIST == ret || OB_SCHEMA_ERROR == ret) {
+      ret = OB_SUCCESS;
+    }
+  } else if (OB_ISNULL(table_schema) || !table_schema->is_user_table()) {
+  } else if (OB_FAIL(guard->get_database_schema(table_schema->get_database_id(),
+                                                database_schema))
+             || OB_ISNULL(database_schema)) {
+    if (OB_SUCC(ret)) {
+      ret = OB_ERR_UNEXPECTED;
+    }
+  } else {
+    const auto &cids = spec.tsc_ctdef_.get_full_acccess_cids();
+    for (int64_t i = 0; OB_SUCC(ret) && i < cids.count(); ++i) {
+      const share::schema::ObColumnSchemaV2 *column =
+          table_schema->get_column_schema(cids.at(i));
+      if (NULL == column || !ai_strict_is_ai_column(*table_schema, *column)) {
+        // not an AI column: untouched by strict reads
+      } else if (OB_FAIL(ai_strict_check_column(ctx, *table_schema, *database_schema,
+                                                *column))) {
+      }
+    }
+  }
+  return ret;
+}
+
+} // anonymous namespace
+
 int ObTableScanOp::inner_open()
 {
   int ret = OB_SUCCESS;
@@ -1435,6 +1580,7 @@ int ObTableScanOp::inner_open()
   init_scan_monitor_info();
   if (OB_ISNULL(my_session = GET_MY_SESSION(ctx_))) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(ai_strict_check_table_scan(ctx_, MY_SPEC))) {
   } else if (OB_FAIL(ObDASUtils::check_nested_sql_mutating(MY_SPEC.ref_table_id_, ctx_, true))) {
   } else if (OB_FAIL(init_table_scan_rtdef())) {
   } else if (MY_SPEC.is_fts_ddl_ && OB_FAIL(fts_index_.init(MY_SPEC.is_fts_index_aux_, MY_SPEC.parser_name_,

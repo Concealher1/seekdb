@@ -44,6 +44,16 @@ public:
   bool is_comment_table() const { return is_comment_table_; }
   void set_is_comment_table(const bool flag) { is_comment_table_ = flag; }
 
+  // ALTER TABLE ... RETRY AI COLUMN: the statement carries the internal UPDATE
+  // that invalidates the selected rows and schedules fresh AI column tasks.
+  bool is_ai_column_retry() const { return is_ai_column_retry_; }
+  const common::ObString &get_ai_column_retry_sql() const { return ai_column_retry_sql_; }
+  void set_ai_column_retry(const common::ObString &sql)
+  {
+    is_ai_column_retry_ = true;
+    ai_column_retry_sql_ = sql;
+  }
+
   uint64_t get_alter_table_action_count() { return alter_table_action_count_; }
   void inc_alter_table_action_count() { ++alter_table_action_count_; }
 
@@ -111,6 +121,8 @@ private:
   common::ObSArray<obcall::ObCreateIndexArg*> index_arg_list_;
   common::ObIAllocator *fts_arg_allocator_;
   bool is_alter_triggers_;
+  bool is_ai_column_retry_;
+  common::ObString ai_column_retry_sql_;
   obcall::ObAlterTriggerArg tg_arg_;
   uint64_t alter_table_action_count_;
   obcall::ObExchangePartitionArg exchange_partition_arg_;

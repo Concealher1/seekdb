@@ -1301,7 +1301,28 @@ int ObSchemaServiceSQLImpl::get_sys_variable_schema(
     for (int64_t i = 0; OB_SUCC(ret) && i < ObSysVariables::get_amount(); i++) {
       ObSysVarClassType sys_var_id = ObSysVariables::get_sys_var_id(i);
       const ObSysVarSchema *sys_var = NULL;
-      if (OB_FAIL(sys_variable_schema.get_sysvar_schema(sys_var_id, sys_var))) {
+      ret = sys_variable_schema.get_sysvar_schema(sys_var_id, sys_var);
+      if (OB_ERR_SYS_VARIABLE_UNKNOWN == ret) {
+        // A system variable added by a newer binary has no row in the historical
+        // tables of an older tenant yet.  Mock it from the hardcoded definition
+        // instead of failing the whole schema refresh.
+        ret = OB_SUCCESS;
+        ObSysVarSchema default_sys_var;
+        if (FALSE_IT(default_sys_var.set_data_type(ObSysVariables::get_type(i)))) {
+        } else if (FALSE_IT(default_sys_var.set_flags(ObSysVariables::get_flags(i)))) {
+        } else if (FALSE_IT(default_sys_var.set_schema_version(schema_version))) {
+        } else if (OB_FAIL(default_sys_var.set_name(ObSysVariables::get_name(i)))) {
+        } else if (OB_FAIL(default_sys_var.set_value(ObSysVariables::get_value(i)))) {
+        } else if (OB_FAIL(default_sys_var.set_min_val(ObSysVariables::get_min(i)))) {
+        } else if (OB_FAIL(default_sys_var.set_max_val(ObSysVariables::get_max(i)))) {
+        } else if (OB_FAIL(default_sys_var.set_info(ObSysVariables::get_info(i)))) {
+        } else if (OB_FAIL(sys_variable_schema.add_sysvar_schema(default_sys_var))) {
+        }
+        if (OB_SUCC(ret)) {
+          LOG_INFO("mock missing system variable schema with hardcoded default",
+                   K(sys_var_id), "name", ObSysVariables::get_name(i));
+        }
+      } else if (OB_FAIL(ret)) {
       } else if (OB_ISNULL(sys_var)) {
         ret = OB_ERR_UNEXPECTED;
       } else {

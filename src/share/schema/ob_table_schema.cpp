@@ -2881,6 +2881,7 @@ int ObTableSchema::convert_column_ids_for_ddl(const ObHashMap<uint64_t, uint64_t
   if (OB_FAIL(convert_column_udt_set_ids(column_id_map))) {
   } else if (OB_FAIL(convert_geo_generated_col_ids(column_id_map))) {
   } else if (OB_FAIL(convert_basic_column_ids(column_id_map))) {
+  } else if (OB_FAIL(convert_ai_column_hidden_ids(column_id_map))) {
   } else if (OB_FAIL(convert_column_ids_in_generated_columns(column_id_map))) {
   } else if (OB_FAIL(convert_column_ids_in_constraint(column_id_map))) {
   } else if (OB_FAIL(convert_autoinc_column_id(column_id_map))) {
@@ -6941,6 +6942,36 @@ int ObTableSchema::convert_column_udt_set_ids(const ObHashMap<uint64_t, uint64_t
           }
         }
       }
+    }
+  }
+  return ret;
+}
+
+int ObTableSchema::convert_ai_column_hidden_ids(const hash::ObHashMap<uint64_t, uint64_t> &column_id_map)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_cnt_; i++) {
+    ObColumnSchemaV2 *column = column_array_[i];
+    uint64_t new_state_id = common::OB_INVALID_ID;
+    uint64_t new_request_id = common::OB_INVALID_ID;
+    uint64_t new_result_spec_id = common::OB_INVALID_ID;
+    if (OB_ISNULL(column)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (!column->is_ai_column()
+               || common::OB_INVALID_ID == column->get_ai_state_column_id()) {
+      // not an AI column, or the hidden columns were created and published
+    } else if (OB_FAIL(column_id_map.get_refactored(column->get_ai_state_column_id(),
+                                                    new_state_id))
+               || OB_FAIL(column_id_map.get_refactored(column->get_ai_request_column_id(),
+                                                       new_request_id))
+               || OB_FAIL(column_id_map.get_refactored(column->get_ai_result_spec_column_id(),
+                                                       new_result_spec_id))) {
+    } else if (OB_UNLIKELY(new_state_id < common::OB_APP_MIN_COLUMN_ID
+                           || new_request_id < common::OB_APP_MIN_COLUMN_ID
+                           || new_result_spec_id < common::OB_APP_MIN_COLUMN_ID)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      column->set_ai_column_hidden_ids(new_state_id, new_request_id, new_result_spec_id);
     }
   }
   return ret;

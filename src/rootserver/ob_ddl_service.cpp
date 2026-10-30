@@ -7726,6 +7726,55 @@ int ObDDLService::drop_column_update_new_table(
   return ret;
 }
 
+// An AI column owns three hidden state columns.  ObCreateTableResolver creates
+// them while resolving CREATE TABLE, the ALTER TABLE add column path has to do
+// the same once the new column id has been allocated.
+static int add_ai_hidden_columns_for_alter(ObTableSchema &new_table_schema,
+                                           AlterColumnSchema &alter_column_schema)
+{
+  int ret = OB_SUCCESS;
+  if (!alter_column_schema.is_ai_column()) {
+  } else if (common::OB_INVALID_ID != alter_column_schema.get_ai_state_column_id()) {
+    // the hidden columns were already generated for this alter column
+  } else {
+    uint64_t next_column_id = new_table_schema.get_max_used_column_id();
+    const uint64_t state_id = ++next_column_id;
+    const uint64_t request_id = ++next_column_id;
+    const uint64_t result_spec_id = ++next_column_id;
+    alter_column_schema.set_ai_column_hidden_ids(state_id, request_id, result_spec_id);
+    for (int64_t i = 0; OB_SUCC(ret) && i < 3; ++i) {
+      const ObObjType hidden_type = (0 == i) ? ObInt32Type : ObLongTextType;
+      const char *hidden_suffix = (0 == i) ? "status"
+                                 : (1 == i ? "request" : "result_spec");
+      const uint64_t hidden_column_id = 0 == i ? state_id
+                                        : (1 == i ? request_id : result_spec_id);
+      ObSqlString hidden_name;
+      ObColumnSchemaV2 hidden_col;
+      if (OB_FAIL(hidden_name.append_fmt("__ai_%lu_%s",
+                                         alter_column_schema.get_column_id(),
+                                         hidden_suffix))) {
+      } else if (OB_FAIL(hidden_col.set_column_name(hidden_name.string()))) {
+      } else {
+        hidden_col.set_column_id(hidden_column_id);
+        hidden_col.set_data_type(hidden_type);
+        hidden_col.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[hidden_type]);
+        hidden_col.set_nullable(true);
+        hidden_col.set_is_hidden(true);
+        hidden_col.set_charset_type(CHARSET_UTF8MB4);
+        hidden_col.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+        hidden_col.set_prev_column_id(UINT64_MAX);
+        hidden_col.set_next_column_id(UINT64_MAX);
+        hidden_col.set_table_id(new_table_schema.get_table_id());
+        if (OB_FAIL(new_table_schema.add_column(hidden_col))) {
+          LOG_WARN("failed to add AI column hidden column", KR(ret),
+                   K(hidden_name.string()), K(hidden_column_id));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 // update relevant inner table if all of schema_guard, ddl_operator and trans are not null
 int ObDDLService::add_new_column_to_table_schema(
     const ObTableSchema &origin_table_schema,
@@ -7824,7 +7873,28 @@ int ObDDLService::add_new_column_to_table_schema(
       ret = OB_ERR_UNEXPECTED;
     } else {
       alter_column_schema.set_prev_column_id(mem_col->get_prev_column_id());
-      if (update_inner_table) {
+      if (alter_column_schema.is_ai_column()) {
+        if (OB_FAIL(add_ai_hidden_columns_for_alter(new_table_schema,
+                                                    alter_column_schema))) {
+        } else if (update_inner_table) {
+          const uint64_t hidden_ids[3] = {
+              alter_column_schema.get_ai_state_column_id(),
+              alter_column_schema.get_ai_request_column_id(),
+              alter_column_schema.get_ai_result_spec_column_id()};
+          for (int64_t i = 0; OB_SUCC(ret) && i < 3; ++i) {
+            const ObColumnSchemaV2 *hidden_col =
+                new_table_schema.get_column_schema(hidden_ids[i]);
+            if (OB_ISNULL(hidden_col)) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("AI column hidden column is missing", KR(ret), K(hidden_ids[i]));
+            } else if (OB_FAIL(ddl_operator->insert_single_column(
+                           *trans, new_table_schema,
+                           const_cast<ObColumnSchemaV2 &>(*hidden_col)))) {
+            }
+          }
+        }
+      }
+      if (OB_SUCC(ret) && update_inner_table) {
         if (OB_FAIL(ddl_operator->insert_single_column(*trans,
                 new_table_schema, alter_column_schema))) {
         }

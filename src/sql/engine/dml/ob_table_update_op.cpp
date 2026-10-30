@@ -332,6 +332,10 @@ OB_INLINE int ObTableUpdateOp::update_row_to_das()
       } else if (OB_FAIL(calc_tablet_loc(upd_ctdef, upd_rtdef, old_tablet_loc, new_tablet_loc))) {
       } else if (OB_FAIL(ObDMLService::update_row(upd_ctdef, upd_rtdef, old_tablet_loc, new_tablet_loc, dml_rtctx_,
                                                  modify_row.old_row_, modify_row.new_row_, modify_row.full_row_))) {
+      } else if (0 == j && upd_rtdef.is_row_changed_ && OB_FAIL(ObDMLService::on_ai_column_row_change(
+                     ctx_, eval_ctx_, upd_ctdef, upd_rtdef.dupd_rtdef_,
+                     new_tablet_loc->tablet_id_, AI_COLUMN_TASK_UPDATE,
+                     &upd_ctdef.dupd_ctdef_.updated_column_ids_))) {
       } else if (need_after_row_process(upd_ctdef) && OB_FAIL(dml_modify_rows_.push_back(modify_row))) {
       } else {
         ++upd_rtdef.found_rows_;

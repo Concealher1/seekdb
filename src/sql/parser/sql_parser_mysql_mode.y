@@ -340,7 +340,7 @@ END_P SET_VAR DELIMITER
 
         RECOVER REDUNDANT REFRESH RELAY RELAYLOG RELAY_LOG_FILE RELAY_LOG_POS RELAY_THREAD RELOAD REMOVE
         REPEATABLE RESET RESPECT RESTART RESTORE RESUME RETURNED_SQLSTATE RETURNS RETURNING REVERSE
-        REWRITE ROLLBACK ROLLUP ROUTINE ROW ROWID ROW_COUNT ROW_FORMAT ROWS RTREE
+        REWRITE ROLLBACK ROLLUP ROUTINE ROW ROWID ROW_COUNT ROW_FORMAT ROWS RTREE RETRY
         RUN RECYCLEBIN REPLICATION ROTATE ROW_NUMBER RUDUNDANT RECURSIVE RANDOM REDO_TRANSPORT_OPTIONS
         RANK READ_ONLY RECOVERY REJECT ROLE
 
@@ -14761,6 +14761,20 @@ opt_set table_option_list_space_seperated
   malloc_non_terminal_node(rename_node, result->malloc_pool_, T_TABLE_RENAME, 1, $3);
   malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_TABLE_OPTION, 1, rename_node);
 }
+| RETRY AI COLUMN column_name opt_where
+{
+  // AI COLUMN RETRY re-evaluates one AI column for the rows selected by an
+  // ordinary SQL predicate.  The raw predicate text is kept on the node so the
+  // resolver can build the internal UPDATE that invalidates the rows and
+  // enqueues fresh tasks.  Bare STATUS in the predicate is the AI column state
+  // pseudo column; a backticked `status` addresses the physical column.
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_RETRY, 2, $4, $5);
+  $$->str_value_ = NULL;
+  $$->str_len_ = 0;
+  if (NULL != $5) {
+    dup_expr_string($$, result, @5.first_column, @5.last_column);
+  }
+}
 | alter_index_option
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_INDEX_OPTION, 1, $1);
@@ -18133,6 +18147,7 @@ ACCOUNT
 |       RESUME
 |       RETURNED_SQLSTATE
 |       RETURNING
+|       RETRY
 |       RETURNS
 |       REVERSE
 |       REWRITE

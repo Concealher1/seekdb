@@ -353,6 +353,14 @@ public:
    virtual ~ObAIFuncModel() {}
    // completion
    int call_completion(ObString &prompt, ObJsonObject *config, ObString &result);
+   // completion with a caller supplied system message.  The asynchronous AI
+   // column worker uses it to send the typed output contract stored in
+   // __all_ai_column.normalized_expr (for example "Return exactly one valid
+   // JSON value.") to the model instead of an empty system prompt.
+   int call_completion(ObString &system_prompt,
+                       ObString &prompt,
+                       ObJsonObject *config,
+                       ObString &result);
    int call_completion_vector(ObArray<ObString> &prompts, ObJsonObject *config, ObArray<ObString> &results);
    // dense_embedding
    int call_dense_embedding(ObString &content, ObJsonObject *config, ObString &result);
