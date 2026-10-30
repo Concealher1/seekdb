@@ -1039,15 +1039,24 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(original_parallelism <= 0)) {
     ret = OB_INVALID_ARGUMENT;
-  } else {
+  } else if (share::schema::is_fts_index(index_type)) {
+    // A fulltext index build is a scan -> tokenize -> sort -> PX SSTable write
+    // pipeline.  With the ALTER TABLE default (parallelism 1) the sort and the
+    // SSTable writer are effectively serialized, which dominates the build.
+    // Raise only the implicit default to a machine-sized DOP; an explicitly
+    // requested parallelism is kept as-is so user intent is preserved.
+    int64_t base_parallelism = original_parallelism;
+    if (original_parallelism <= 1) {
+      base_parallelism = MAX(2L, MIN(8L, common::get_cpu_num()));
+    }
     switch (index_type) {
       case share::schema::ObIndexType::INDEX_TYPE_ROWKEY_DOC_ID_LOCAL:
-        decided_parallelism = MAX(original_parallelism, 1L);
+        decided_parallelism = MAX(base_parallelism, 1L);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
-        decided_parallelism = MAX(original_parallelism / 3, 1L);
+        decided_parallelism = MAX(base_parallelism / 3, 1L);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:
