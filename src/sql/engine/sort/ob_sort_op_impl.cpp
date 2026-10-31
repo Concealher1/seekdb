@@ -101,14 +101,14 @@ void ObSortOpImpl::ObAdaptiveQS::aqs_cps_qs(int64_t l, int64_t r,
       int compare_res = compare_vals(i, l, differ_at, common_prefix, cache_offset);
       if (compare_res < 0) {
         if (i+1 < gt) {
-          __builtin_prefetch(sort_rows_.at(i+1).key_ptr_);
+          __builtin_prefetch(aqs_item(i+1).key_ptr_);
         }
         lt_cp = min(differ_at, lt_cp);
         swap(i, lt);
         lt++;
       } else if (compare_res == 0) {
         if (i+1 < gt) {
-          __builtin_prefetch(sort_rows_.at(i+1).key_ptr_);
+          __builtin_prefetch(aqs_item(i+1).key_ptr_);
         }
       } else {
         gt_cp = min(differ_at, gt_cp);
@@ -150,7 +150,7 @@ void ObSortOpImpl::ObAdaptiveQS::aqs_radix(int64_t l, int64_t r,
   int cache_offset = offset;
 
   for (int i = l; i < r; i++) {
-    if (sort_rows_.at(i).len_ == common_prefix) {
+    if (aqs_item(i).len_ == common_prefix) {
       swap(i, more_pos);
       swap(more_pos, done_pos);
       more_pos++;
@@ -178,16 +178,16 @@ void ObSortOpImpl::ObAdaptiveQS::aqs_radix(int64_t l, int64_t r,
     if (val == 0) {
     // only last byte of the cache is effective
     } else if (val == 1) {
-      sort_rows_.at(i).sub_cache_[0] = sort_rows_.at(i).sub_cache_[1];
+      aqs_item(i).sub_cache_[0] = aqs_item(i).sub_cache_[1];
       cache_offset = common_prefix + 1;
     // values in the cache are totally ineffective
     } else {
-      unsigned char *x = ((unsigned char *)(sort_rows_.at(i).key_ptr_)) + common_prefix;
-      sort_rows_.at(i).sub_cache_[0] = *x;
+      unsigned char *x = ((unsigned char *)(aqs_item(i).key_ptr_)) + common_prefix;
+      aqs_item(i).sub_cache_[0] = *x;
       cache_offset = common_prefix + 1;
     }
 
-    if (sort_rows_.at(i).len_ == common_prefix + 1) {
+    if (aqs_item(i).len_ == common_prefix + 1) {
         swap(i, more_pos);
         more_pos++;
     } else {
@@ -213,7 +213,7 @@ void ObSortOpImpl::ObAdaptiveQS::inplace_radixsort_more_bucket(int64_t l, int64_
     if (div_val == -1) {
       int more_l = l;
       for (int i = l; i < r; i++) {
-        if (sort_rows_.at(i).len_ == common_prefix + 1) {
+        if (aqs_item(i).len_ == common_prefix + 1) {
           swap(more_l, i);
           more_l++;
         }
@@ -222,17 +222,17 @@ void ObSortOpImpl::ObAdaptiveQS::inplace_radixsort_more_bucket(int64_t l, int64_
       // update cache
       if (update) {
         if(more_l < r) {
-          __builtin_prefetch((&sort_rows_.at(more_l).len_));
-          __builtin_prefetch(((unsigned char *)(sort_rows_.at(more_l).key_ptr_)) + common_prefix);
+          __builtin_prefetch((&aqs_item(more_l).len_));
+          __builtin_prefetch(((unsigned char *)(aqs_item(more_l).key_ptr_)) + common_prefix);
         }
         for (int i = more_l; i < r; i++) {
-          unsigned char *x = ((unsigned char *)(sort_rows_.at(i).key_ptr_)) + common_prefix;
+          unsigned char *x = ((unsigned char *)(aqs_item(i).key_ptr_)) + common_prefix;
           if ( i+1 < r ) {
-            __builtin_prefetch((&sort_rows_.at(i+1).len_));
-            __builtin_prefetch(((unsigned char *)(sort_rows_.at(i+1).key_ptr_)) + common_prefix);
+            __builtin_prefetch((&aqs_item(i+1).len_));
+            __builtin_prefetch(((unsigned char *)(aqs_item(i+1).key_ptr_)) + common_prefix);
           }
-          sort_rows_.at(i).sub_cache_[0] = *(x + 1);
-          sort_rows_.at(i).sub_cache_[1] = (common_prefix + 2 == sort_rows_.at(i).len_) ? 0x00 : *(x+2);
+          aqs_item(i).sub_cache_[0] = *(x + 1);
+          aqs_item(i).sub_cache_[1] = (common_prefix + 2 == aqs_item(i).len_) ? 0x00 : *(x+2);
         }
       }
       aqs_cps_qs(more_l, r, common_prefix + 1, depth_limit, cache_offset);
@@ -240,11 +240,11 @@ void ObSortOpImpl::ObAdaptiveQS::inplace_radixsort_more_bucket(int64_t l, int64_
     }
 
     int divide_line = l;
-    __builtin_prefetch((&sort_rows_.at(l).sub_cache_[0]));
+    __builtin_prefetch((&aqs_item(l).sub_cache_[0]));
     for (int i = l; i < r; i++) {
       // byte b = index_bytes[i];
-      if (i+1 < r) __builtin_prefetch((&sort_rows_.at(i+1).sub_cache_[0]));
-      if ((sort_rows_.at(i).sub_cache_[0] & masks[div_val]) == 0) {
+      if (i+1 < r) __builtin_prefetch((&aqs_item(i+1).sub_cache_[0]));
+      if ((aqs_item(i).sub_cache_[0] & masks[div_val]) == 0) {
         swap(i, divide_line);
         divide_line++;
       }
@@ -267,7 +267,20 @@ int fast_compare_normal(const unsigned char *s, const unsigned char *t,
                         int64_t length, int64_t &differ_at, int64_t cache_ends)
 {
   int cmp_ret = 0;
-  for (int i = 0; (cmp_ret == 0)  && i < length; i++) {
+  int64_t i = 0;
+  // Skip equal 8-byte words; on little-endian the lowest set bit of the XOR is the first differing
+  // byte, so the byte loop below then stops right at it.
+  for (; i + 8 <= length; i += 8) {
+    uint64_t sw = 0;
+    uint64_t tw = 0;
+    MEMCPY(&sw, s + i, sizeof(sw));
+    MEMCPY(&tw, t + i, sizeof(tw));
+    if (sw != tw) {
+      i += __builtin_ctzll(sw ^ tw) >> 3;
+      break;
+    }
+  }
+  for (; (cmp_ret == 0) && i < length; i++) {
     if (s[i] != t[i]) {
       differ_at = i + cache_ends;
       cmp_ret = s[i] - t[i];
@@ -351,7 +364,7 @@ int ObSortOpImpl::ObAdaptiveQS::compare_cache(AQSItem &l,
 int ObSortOpImpl::ObAdaptiveQS::compare_vals(int64_t l, int64_t r,
                                              int64_t &differ_at, int64_t common_prefix,
                                              int64_t cache_offset) {
-  return compare_cache(sort_rows_.at(l), sort_rows_.at(r), differ_at, common_prefix, cache_offset);
+  return compare_cache(aqs_item(l), aqs_item(r), differ_at, common_prefix, cache_offset);
 }
 
 ObSortOpImpl::Compare::Compare()

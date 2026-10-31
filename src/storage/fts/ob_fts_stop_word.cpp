@@ -178,6 +178,31 @@ bool is_ascii_already_lower(const ObCollationType coll_type, const ObString &str
   }
   return is_lower;
 }
+
+// Lower-cases utf8mb4 words made of ASCII and U+4000..U+9FFF (CJK, no case mapping) only, i.e. the
+// bulk of mixed Chinese/English text, without the generic per-character case table.
+bool casedown_utf8mb4_fast(const ObString &src, char *dst)
+{
+  bool done = true;
+  const unsigned char *p = reinterpret_cast<const unsigned char *>(src.ptr());
+  const int64_t len = src.length();
+  for (int64_t i = 0; done && i < len; ) {
+    const unsigned char c = p[i];
+    if (c < 0x80) {
+      dst[i] = (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : static_cast<char>(c);
+      i += 1;
+    } else if (c >= 0xE4 && c <= 0xE9 && i + 2 < len
+               && (p[i + 1] & 0xC0) == 0x80 && (p[i + 2] & 0xC0) == 0x80) {
+      dst[i] = static_cast<char>(c);
+      dst[i + 1] = static_cast<char>(p[i + 1]);
+      dst[i + 2] = static_cast<char>(p[i + 2]);
+      i += 3;
+    } else {
+      done = false;
+    }
+  }
+  return done;
+}
 } // anonymous namespace
 
 int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
@@ -187,8 +212,14 @@ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
     ret = OB_INVALID_ARGUMENT;
   } else if (flag_.casedown()) {
     const ObString src_str = src.get_word().get_string();
+    char *buf = nullptr;
     if (is_ascii_already_lower(word_meta_.get_collation_type(), src_str)) {
       dst = src;
+    } else if (CHARSET_UTF8MB4 == ObCharset::charset_type_by_coll(word_meta_.get_collation_type())
+               && OB_NOT_NULL(buf = static_cast<char *>(allocator_.alloc(src_str.length())))
+               && casedown_utf8mb4_fast(src_str, buf)) {
+      ObFTWord tmp(src.get_word().len_, buf, word_meta_);
+      dst = tmp;
     } else {
       ObString dst_str;
       if (OB_FAIL(ObCharset::tolower(

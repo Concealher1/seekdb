@@ -703,6 +703,12 @@ private:
 
   int inner_get_next_fts_index_row();
   int fetch_next_fts_index_rows();
+  // vectorized fulltext index build: a batch holds the word rows of one source document, so that
+  // the words and the document id stay valid until the batch is consumed
+  int inner_get_next_fts_index_batch(const int64_t max_row_cnt);
+  int fetch_next_fts_index_batch_doc();
+  int fill_fts_passthrough_cols(const int64_t row_cnt);
+  int init_fts_output_exprs();
   int fill_generated_fts_cols(blocksstable::ObDatumRow *row);
   int get_output_fts_col_expr_by_type(const ObExprOperatorType &type, ObExpr *&expr);
   bool is_resume_point_saved();
@@ -735,6 +741,9 @@ protected:
   bool in_rescan_;
   ObDomainIndexCache domain_index_;
   ObFTIndexRowCache fts_index_;
+  // generated fulltext columns of the output, in the column order of ObFTIndexRowCache rows
+  ObExpr *fts_output_exprs_[share::ObFtsIndexBuilderUtil::OB_FTS_INDEX_OR_DOC_WORD_TABLE_COL_CNT];
+  bool fts_output_exprs_inited_;
 
   // output_ is used to output data, TSC operator directly invokes output_::get_next_row(s),
   // it points to fold_iter_ in group rescan and iter_tree_ in normal scan.

@@ -290,8 +290,7 @@ public:
     if (OB_FAIL(add_row(expr, store_row))) {
     } else if (use_heap_sort_ || use_partition_topn_sort_) {
       sort_need_dump = false;
-    } else {
-      sort_need_dump = need_dump();
+    } else if (OB_FAIL(check_need_dump(sort_need_dump))) {
     }
     return ret;
   }
@@ -323,8 +322,7 @@ public:
     if (OB_FAIL(add_batch(exprs, skip, batch_size, start_pos, append_row_count))) {
     } else if (use_heap_sort_ || use_partition_topn_sort_) {
       sort_need_dump = false;
-    } else {
-      sort_need_dump = need_dump();
+    } else if (OB_FAIL(check_need_dump(sort_need_dump))) {
     }
     return ret;
   }
@@ -565,8 +563,11 @@ public:
       void insertion_sort(int64_t l, int64_t r,
                             int64_t common_prefix,
                             int64_t cache_offset);
+      // Positions inside the sort are always within [0, count): ObIArrayWrap::at() checks the
+      // index in an out-of-line call, which dominated the radix partition loops.
+      inline AQSItem &aqs_item(int64_t idx) { return sort_rows_.get_data()[idx]; }
       inline void swap(int64_t l, int64_t r) {
-        std::swap(sort_rows_[r], sort_rows_[l]);
+        std::swap(aqs_item(r), aqs_item(l));
       }
       inline int compare_vals(int64_t l, int64_t r, int64_t &differ_at,
                               int64_t common_prefix, int64_t cache_offset);
@@ -716,6 +717,17 @@ protected:
         || mem_context_->used() >= profile_.get_max_bound();
   }
   int preprocess_dump(bool &dumped);
+  // Whether the rows can not be kept in memory any more: under automatic memory management the
+  // memory bound is first extended as the next add would do, so that callers switching to a
+  // dump-friendly strategy (e.g. prescan of online DDL) only do it when a dump is inevitable.
+  int check_need_dump(bool &sort_need_dump)
+  {
+    int ret = OB_SUCCESS;
+    sort_need_dump = need_dump();
+    if (sort_need_dump && OB_FAIL(preprocess_dump(sort_need_dump))) {
+    }
+    return ret;
+  }
   // before add row process: update date used memory, try dump ...
   int before_add_row();
   // after add row process: check local merge sort order and add %sr to %rows_
