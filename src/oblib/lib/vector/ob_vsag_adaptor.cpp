@@ -439,8 +439,9 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     }
     remaining -= bytes;
   }
+  const int64_t total_us = ObTimeUtility::current_time() - start_us;
   LOG_INFO("[OBVSAG][cuVS] serialized GPU CAGRA snapshot", KP(key), K(n), K(dim32),
-           K(built), K(build_us), K(graph_bytes));
+           K(built), K(build_us), K(total_us), K(graph_bytes));
   return true;
 }
 
