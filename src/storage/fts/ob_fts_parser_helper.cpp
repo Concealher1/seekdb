@@ -377,7 +377,12 @@ int ObFTParseHelper::segment(
   } else if (OB_ISNULL(cs = common::ObCharset::get_charset(type))) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    words.reuse();
+    // reuse() is clear(): it walks and write-locks every bucket.  A freshly
+    // created word map (the common tokenize() case) is already empty, so the
+    // call is pure overhead there.
+    if (!words.empty()) {
+      words.reuse();
+    }
     ObAddWord add_word(parser_property_, meta, add_word_flag_, *allocator_, words);
     if (OB_FAIL(segment(
                     parser_property_,

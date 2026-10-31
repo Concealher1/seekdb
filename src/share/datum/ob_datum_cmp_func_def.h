@@ -371,6 +371,22 @@ struct ObDatumCollectionCmp : public ObDefined<>
 ///////////////////////////////////////////////////////////////////////////////
 
 
+// Resolve the charset handler for a collation once and reuse it afterwards.
+// The (collation -> charset handler) mapping is immutable for the lifetime of
+// the process, but ObCharset::strcmpsp resolves it on every call (argument
+// validation + charset table lookup + lazy-init check).  Hot paths that compare
+// the same collation millions of times (e.g. the FTS index build sort under
+// utf8mb4_general_ci) pay that overhead per comparison.  Caching the resolved
+// handler per collation keeps the exact same comparison (same strnncollsp call
+// with the same arguments), only the lookup is hoisted out of the loop.
+template <ObCollationType CS_TYPE>
+inline const ObCharsetInfo *get_cached_charset_handler()
+{
+  // Function-local static: thread-safe one-time initialization, no explicit lock.
+  static const ObCharsetInfo *const cs_info = ObCharset::get_charset(CS_TYPE);
+  return cs_info;
+}
+
 struct ObDatumStrCmpImpl
 {
   static int OB_INLINE cmp(const ObDatum &l, const ObDatum &r, int &cmp_ret,
@@ -380,6 +396,26 @@ struct ObDatumStrCmpImpl
     cmp_ret = cmp_ret > 0 ? 1 : (cmp_ret < 0 ? -1 : 0);
     return OB_SUCCESS;
   }
+  // Same semantics as cmp(), but reuses a pre-resolved charset handler and
+  // therefore skips the per-call collation->charset resolution.  Falls back to
+  // cmp() (and its argument validation) when the handler is not available.
+  static int OB_INLINE cmp_with_handler(const ObDatum &l, const ObDatum &r, int &cmp_ret,
+                                        const ObCollationType cs,
+                                        const ObCharsetInfo *cs_info,
+                                        const bool with_end_space)
+  {
+    if (OB_LIKELY(nullptr != cs_info)) {
+      const int cmp_res = cs_info->coll->strnncollsp(
+          cs_info,
+          reinterpret_cast<const unsigned char *>(l.ptr_), l.len_,
+          reinterpret_cast<const unsigned char *>(r.ptr_), r.len_,
+          with_end_space);
+      cmp_ret = cmp_res > 0 ? 1 : (cmp_res < 0 ? -1 : 0);
+      return OB_SUCCESS;
+    } else {
+      return cmp(l, r, cmp_ret, cs, with_end_space);
+    }
+  }
 };
 
 template <ObCollationType CS_TYPE, bool WITH_END_SPACE>
@@ -387,7 +423,8 @@ struct ObDatumStrCmp : public ObDefined<SupportedCollection<CS_TYPE>::defined_>
 {
   inline static int cmp(const ObDatum &l, const ObDatum &r, int &cmp_ret)
   {
-    return ObDatumStrCmpImpl::cmp(l, r, cmp_ret, CS_TYPE, WITH_END_SPACE);
+    return ObDatumStrCmpImpl::cmp_with_handler(
+        l, r, cmp_ret, CS_TYPE, get_cached_charset_handler<CS_TYPE>(), WITH_END_SPACE);
   }
 };
 

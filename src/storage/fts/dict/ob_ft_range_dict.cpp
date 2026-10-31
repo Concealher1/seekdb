@@ -378,24 +378,61 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
   return last_hit.dict_->match_with_hit(single_word, last_hit, hit);
 }
 
+namespace
+{
+// The dict words of a range dict are all compared with utf8mb4_bin.  Resolve the
+// charset handler once instead of letting ObCharset::strcmp re-resolve it (and
+// re-validate the arguments) on every probe.
+const ObCharsetInfo *get_utf8mb4_bin_cs()
+{
+  static const ObCharsetInfo *const cs_info = ObCharset::get_charset(CS_TYPE_UTF8MB4_BIN);
+  return cs_info;
+}
+
+int strcmp_utf8mb4_bin(const ObString &l, const ObString &r)
+{
+  const ObCharsetInfo *cs_info = get_utf8mb4_bin_cs();
+  if (OB_LIKELY(nullptr != cs_info)) {
+    return cs_info->coll->strnncoll(cs_info,
+                                    reinterpret_cast<const unsigned char *>(l.ptr()), l.length(),
+                                    reinterpret_cast<const unsigned char *>(r.ptr()), r.length(),
+                                    false);
+  } else {
+    return ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN, l, r);
+  }
+}
+} // anonymous namespace
+
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;
-  bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
-      found = true;
+  // The ranges are produced sequentially by a dict iterator ordered by word, so
+  // range_dicts_ is sorted by start word and the ranges do not overlap.  Binary
+  // search for the last range whose start word is <= single_word, then verify the
+  // end word.  The selected range (and the comparison function used) is exactly
+  // the one the linear scan would have selected, only with fewer probes.
+  int64_t low = 0;
+  int64_t high = range_dicts_.size() - 1;
+  int64_t candidate = -1;
+  while (low <= high) {
+    const int64_t mid = low + (high - low) / 2;
+    const ObString range_start = range_dicts_[mid].start_.get_word();
+    if (strcmp_utf8mb4_bin(range_start, single_word) <= 0) {
+      candidate = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
     }
   }
-  if (!found) {
+  if (candidate >= 0) {
+    const ObString range_end = range_dicts_[candidate].end_.get_word();
+    if (strcmp_utf8mb4_bin(range_end, single_word) >= 0) {
+      dict = range_dicts_[candidate].dict_;
+    } else {
+      // not found, dis match
+      ret = OB_ENTRY_NOT_EXIST;
+    }
+  } else {
     // not found, dis match
     ret = OB_ENTRY_NOT_EXIST;
   }

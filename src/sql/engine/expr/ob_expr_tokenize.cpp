@@ -39,6 +39,157 @@ namespace oceanbase
 {
 namespace sql
 {
+namespace
+{
+// tokenize(text, 'ik') re-derives the parser inner name ("ik.1") and re-formats
+// the parser properties JSON on every evaluation, although both are pure
+// functions of the parser name / parser properties strings.  This small
+// per-thread cache keeps the derived strings so that repeated calls with the
+// same parser skip the JSON round trip and the parser name serialisation.
+class ObTokenizeSetupCache
+{
+public:
+  static constexpr int64_t MAX_ENTRY_CNT = 8;
+  static constexpr int64_t MAX_ARENA_BYTES = 64 * 1024;
+
+  struct NameEntry
+  {
+    ObString raw_name_;
+    ObString inner_name_;
+  };
+  struct PropsEntry
+  {
+    ObString parser_name_;
+    ObString raw_properties_;
+    ObString reformed_properties_;
+  };
+
+public:
+  static ObTokenizeSetupCache &get_instance()
+  {
+    static thread_local ObTokenizeSetupCache cache;
+    return cache;
+  }
+
+  bool find_inner_name(const ObString &raw_name, ObString &inner_name) const
+  {
+    bool found = false;
+    for (int64_t i = 0; !found && i < name_cnt_; ++i) {
+      if (names_[i].raw_name_ == raw_name) {
+        inner_name = names_[i].inner_name_;
+        found = true;
+      }
+    }
+    return found;
+  }
+
+  void put_inner_name(const ObString &raw_name, const ObString &inner_name)
+  {
+    ObString raw_copy;
+    ObString inner_copy;
+    if (!has_space()
+        || OB_SUCCESS != copy_string(raw_name, raw_copy)
+        || OB_SUCCESS != copy_string(inner_name, inner_copy)) {
+      return;
+    }
+    int64_t idx = 0;
+    if (name_cnt_ < MAX_ENTRY_CNT) {
+      idx = name_cnt_++;
+    } else {
+      idx = name_next_ % MAX_ENTRY_CNT;
+      ++name_next_;
+    }
+    names_[idx].raw_name_ = raw_copy;
+    names_[idx].inner_name_ = inner_copy;
+  }
+
+  bool find_reformed_properties(const ObString &parser_name,
+                               const ObString &raw_properties,
+                               ObString &reformed_properties) const
+  {
+    bool found = false;
+    for (int64_t i = 0; !found && i < props_cnt_; ++i) {
+      if (props_[i].parser_name_ == parser_name
+          && props_[i].raw_properties_ == raw_properties) {
+        reformed_properties = props_[i].reformed_properties_;
+        found = true;
+      }
+    }
+    return found;
+  }
+
+  void put_reformed_properties(const ObString &parser_name,
+                               const ObString &raw_properties,
+                               const ObString &reformed_properties)
+  {
+    ObString name_copy;
+    ObString raw_copy;
+    ObString reformed_copy;
+    if (!has_space()
+        || OB_SUCCESS != copy_string(parser_name, name_copy)
+        || OB_SUCCESS != copy_string(raw_properties, raw_copy)
+        || OB_SUCCESS != copy_string(reformed_properties, reformed_copy)) {
+      return;
+    }
+    int64_t idx = 0;
+    if (props_cnt_ < MAX_ENTRY_CNT) {
+      idx = props_cnt_++;
+    } else {
+      idx = props_next_ % MAX_ENTRY_CNT;
+      ++props_next_;
+    }
+    props_[idx].parser_name_ = name_copy;
+    props_[idx].raw_properties_ = raw_copy;
+    props_[idx].reformed_properties_ = reformed_copy;
+  }
+
+private:
+  ObTokenizeSetupCache() : arena_(ObMemAttr("TokenizeSetup")) {}
+  ~ObTokenizeSetupCache() = default;
+
+  bool has_space() const { return arena_.used() < MAX_ARENA_BYTES; }
+
+  int copy_string(const ObString &src, ObString &dst)
+  {
+    int ret = OB_SUCCESS;
+    dst.reset();
+    if (0 == src.length()) {
+      // keep the empty string as is
+    } else {
+      char *buf = static_cast<char *>(arena_.alloc(src.length()));
+      if (OB_ISNULL(buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        MEMCPY(buf, src.ptr(), src.length());
+        dst.assign_ptr(buf, src.length());
+      }
+    }
+    return ret;
+  }
+
+private:
+  ObArenaAllocator arena_;
+  NameEntry names_[MAX_ENTRY_CNT];
+  int64_t name_cnt_ = 0;
+  int64_t name_next_ = 0;
+  PropsEntry props_[MAX_ENTRY_CNT];
+  int64_t props_cnt_ = 0;
+  int64_t props_next_ = 0;
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObTokenizeSetupCache);
+};
+
+// The dictionary loader handle is keyed by (parser name, charset) and lives in
+// the process global loader map.  Looking it up again on every tokenize() call
+// (write lock + refcount churn) is pure overhead; keep one handle per thread.
+storage::ObDicLoaderHandle &get_thread_local_ik_loader_handle()
+{
+  static thread_local storage::ObDicLoaderHandle handle;
+  return handle;
+}
+} // anonymous namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -221,16 +372,23 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
 int ObExprTokenize::construct_ft_parser_inner_name(const ObString &input_str, TokenizeParam &param)
 {
   int ret = OB_SUCCESS;
-  storage::ObFTParser parser;
-
-  char *parser_name_buf = nullptr;
-  if (OB_ISNULL(parser_name_buf
-                = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(parser.init(input_str))) {
-  } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, storage::OB_FT_PARSER_NAME_LENGTH))) {
+  ObTokenizeSetupCache &cache = ObTokenizeSetupCache::get_instance();
+  ObString cached_name;
+  if (cache.find_inner_name(input_str, cached_name)) {
+    param.parser_name_ = cached_name;
   } else {
-    param.parser_name_ = ObString::make_string(parser_name_buf);
+    storage::ObFTParser parser;
+
+    char *parser_name_buf = nullptr;
+    if (OB_ISNULL(parser_name_buf
+                  = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(parser.init(input_str))) {
+    } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, storage::OB_FT_PARSER_NAME_LENGTH))) {
+    } else {
+      param.parser_name_ = ObString::make_string(parser_name_buf);
+      cache.put_inner_name(input_str, param.parser_name_);
+    }
   }
   return ret;
 }
@@ -375,15 +533,26 @@ int ObExprTokenize::parse_parser_properties(const ObExpr &expr,
 int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &properties)
 {
   int ret = OB_SUCCESS;
-  storage::ObFTParserJsonProps parser_properties;
+  // `properties` is normally a reference to this->properties_, which is
+  // overwritten below, so keep the raw value as the cache key.
+  const ObString raw_properties = properties;
+  ObTokenizeSetupCache &cache = ObTokenizeSetupCache::get_instance();
+  ObString cached_properties;
+  if (cache.find_reformed_properties(parser_name_, raw_properties, cached_properties)) {
+    properties_ = cached_properties;
+  } else {
+    storage::ObFTParserJsonProps parser_properties;
 
-  if (OB_FAIL(parser_properties.init())) {
-  } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
-    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
-  } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
-                                                             ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                                                             true))) {
-  } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+    if (OB_FAIL(parser_properties.init())) {
+    } else if (OB_FAIL(parser_properties.parse_from_valid_str(raw_properties))) {
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
+    } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
+                                                               ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                                               true))) {
+    } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+    } else {
+      cache.put_reformed_properties(parser_name_, raw_properties, properties_);
+    }
   }
 
   return ret;
@@ -393,17 +562,37 @@ int ObExprTokenize::TokenizeParam::try_load_dictionary_for_ik()
 {
   int ret = OB_SUCCESS;
   bool need_to_load_dic = false;
-  storage::ObDicLoaderHandle dic_loader_handle;
+  const ObCharsetType charset_type =
+      ObCharset::charset_type_by_coll(meta_.get_collation_type());
+  // currently only ik, use parser_name_ without version suffix
+  const ObString dic_parser_name =
+      ObString::make_string(storage::ObFTSLiteral::PARSER_NAME_IK);
   if (OB_FAIL(share::ObFtsIndexBuilderUtil::check_need_to_load_dic(
           parser_name_, need_to_load_dic))) {
   } else if (need_to_load_dic) {
-    if (OB_FAIL(storage::ObGenDicLoader::get_instance().get_dic_loader(
-                    ObString::make_string(storage::ObFTSLiteral::PARSER_NAME_IK), // currently only ik, use parser_name_ without version suffix
-                    ObCharset::charset_type_by_coll(meta_.get_collation_type()),
-                    dic_loader_handle))) {
-    } else if (OB_UNLIKELY(!dic_loader_handle.is_valid())) {
-      ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(dic_loader_handle.get_loader()->try_load_dictionary_in_trans())) {
+    if (CHARSET_UTF8MB4 == charset_type) {
+      // Reuse the resolved handle: the loader map itself keeps the loader alive
+      // for the whole process, so caching the handle cannot outlive it.
+      storage::ObDicLoaderHandle &dic_loader_handle = get_thread_local_ik_loader_handle();
+      if (OB_UNLIKELY(!dic_loader_handle.is_valid())) {
+        if (OB_FAIL(storage::ObGenDicLoader::get_instance().get_dic_loader(
+                        dic_parser_name, charset_type, dic_loader_handle))) {
+        }
+      }
+      if (OB_SUCC(ret)) {
+        if (OB_UNLIKELY(!dic_loader_handle.is_valid())) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(dic_loader_handle.get_loader()->try_load_dictionary_in_trans())) {
+        }
+      }
+    } else {
+      storage::ObDicLoaderHandle dic_loader_handle;
+      if (OB_FAIL(storage::ObGenDicLoader::get_instance().get_dic_loader(
+                      dic_parser_name, charset_type, dic_loader_handle))) {
+      } else if (OB_UNLIKELY(!dic_loader_handle.is_valid())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(dic_loader_handle.get_loader()->try_load_dictionary_in_trans())) {
+      }
     }
   }
   return ret;

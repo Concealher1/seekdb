@@ -158,21 +158,48 @@ bool ObAddWord::is_min_max_word(const int64_t c_len) const
   return flag_.min_max_word() && (c_len < min_token_size_ || c_len > max_token_size_);
 }
 
+namespace
+{
+// tolower() copies the word into the allocator and walks it character by
+// character.  For the collations used by fulltext parsing, an all-ASCII word
+// without upper-case letters is unchanged by tolower(), so the copy can be
+// skipped and the source view used directly (same bytes, same result).
+bool is_ascii_already_lower(const ObCollationType coll_type, const ObString &str)
+{
+  bool is_lower = (CS_TYPE_UTF8MB4_GENERAL_CI == coll_type
+                   || CS_TYPE_UTF8MB4_UNICODE_CI == coll_type
+                   || CS_TYPE_UTF8MB4_BIN == coll_type
+                   || CS_TYPE_BINARY == coll_type);
+  for (int64_t i = 0; is_lower && i < str.length(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(str.ptr()[i]);
+    if (OB_UNLIKELY(c >= 0x80) || (c >= 'A' && c <= 'Z')) {
+      is_lower = false;
+    }
+  }
+  return is_lower;
+}
+} // anonymous namespace
+
 int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (flag_.casedown()) {
-    ObString dst_str;
-    if (OB_FAIL(ObCharset::tolower(
-                    word_meta_.get_collation_type(),
-                    src.get_word().get_string(),
-                    dst_str,
-                    allocator_))) {
+    const ObString src_str = src.get_word().get_string();
+    if (is_ascii_already_lower(word_meta_.get_collation_type(), src_str)) {
+      dst = src;
     } else {
-      ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
-      dst = tmp;
+      ObString dst_str;
+      if (OB_FAIL(ObCharset::tolower(
+                      word_meta_.get_collation_type(),
+                      src_str,
+                      dst_str,
+                      allocator_))) {
+      } else {
+        ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
+        dst = tmp;
+      }
     }
   } else {
     dst = src;
@@ -195,23 +222,35 @@ int ObAddWord::check_stopword(const ObFTWord &ft_word, bool &is_stopword)
   return ret;
 }
 
+namespace
+{
+// set_or_update() updates the counter in place when the word already exists and
+// inserts it otherwise, i.e. it is the same find-or-insert as the previous
+// get_refactored() + set_refactored() pair but with a single hash lookup and a
+// single bucket lock, and without re-inserting an existing node.
+struct ObFTWordCountAdder
+{
+  explicit ObFTWordCountAdder(const int64_t word_freq) : word_freq_(word_freq) {}
+  int operator()(common::hash::HashMapPair<ObFTWord, int64_t> &entry) const
+  {
+    entry.second += word_freq_;
+    return OB_SUCCESS;
+  }
+  int64_t word_freq_;
+};
+} // anonymous namespace
+
 int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
 {
   int ret = OB_SUCCESS;
-  int64_t word_count = 0;
   if (OB_UNLIKELY(word.empty() || word_freq <= 0)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (!flag_.groupby_word()) {
     if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
     }
-  } else if (OB_FAIL(word_map_.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
   } else {
-    if (OB_HASH_NOT_EXIST == ret) {
-      word_count = 1;
-    } else {
-      word_count += word_freq;
-    }
-    if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
+    ObFTWordCountAdder adder(word_freq);
+    if (OB_FAIL(word_map_.set_or_update(word, 1/*word count*/, adder))) {
     }
   }
   return ret;
