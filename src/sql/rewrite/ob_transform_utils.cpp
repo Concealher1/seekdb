@@ -12804,6 +12804,56 @@ bool ObTransformUtils::is_full_group_by(ObSelectStmt& stmt, ObSQLMode mode)
   return !stmt.has_order_by() && is_only_full_group_by_on(mode);
 }
 
+int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
+                                                  const ObDMLStmt *stmt,
+                                                  ObRawExpr *match_expr,
+                                                  bool &need_calc,
+                                                  ObIArray<ObExprConstraint> &constraints)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObRawExpr *, 16> relation_exprs;
+  need_calc = true;
+  if (OB_ISNULL(exec_ctx) || OB_ISNULL(stmt) || OB_ISNULL(match_expr)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(stmt->get_relation_exprs(relation_exprs))) {
+  } else {
+    need_calc = false;
+    for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < relation_exprs.count(); ++i) {
+      ObRawExpr *expr = relation_exprs.at(i);
+      bool is_zero = false;
+      if (OB_ISNULL(expr)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (!expr->has_flag(CNT_MATCH_EXPR) || !ObOptimizerUtil::is_sub_expr(match_expr, expr)) {
+        // not related to this match expr
+      } else if (!ObOptimizerUtil::find_item(stmt->get_condition_exprs(), expr)) {
+        // projected, ordered by, grouped by, ... the score itself is observable
+        need_calc = true;
+      } else if (expr == match_expr) {
+        // WHERE MATCH(...) AGAINST(...)
+      } else if (T_OP_BOOL == expr->get_expr_type()
+                 && 1 == expr->get_param_count()
+                 && expr->get_param_expr(0) == match_expr) {
+        // WHERE BOOL(MATCH(...) AGAINST(...))
+      } else if ((T_OP_GT == expr->get_expr_type() || T_OP_LT == expr->get_expr_type())
+                 && 2 == expr->get_param_count()) {
+        // WHERE MATCH(...) AGAINST(...) > 0
+        const bool is_gt = T_OP_GT == expr->get_expr_type();
+        ObRawExpr *score_side = expr->get_param_expr(is_gt ? 0 : 1);
+        ObRawExpr *const_side = expr->get_param_expr(is_gt ? 1 : 0);
+        if (score_side != match_expr || OB_ISNULL(const_side)) {
+          need_calc = true;
+        } else if (OB_FAIL(check_expr_eq_zero(exec_ctx, const_side, is_zero, constraints))) {
+        } else if (!is_zero) {
+          need_calc = true;
+        }
+      } else {
+        need_calc = true;
+      }
+    }
+  }
+  return ret;
+}
+
 int ObTransformUtils::inner_check_need_calc_match_score(ObExecContext *exec_ctx,
                                                         ObRawExpr* expr, 
                                                         ObRawExpr* match_expr, 

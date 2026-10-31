@@ -180,6 +180,96 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObTokenizeSetupCache);
 };
 
+
+// The packed result of tokenize() is a pure function of its arguments: the
+// same (fulltext, parser name, parser properties, output mode, collation)
+// always produces the same JSON.  Workloads tokenize the same text over and
+// over, so keep the packed result of the most recent distinct arguments per
+// thread.  A hit is a hash lookup plus one copy of the result; the tokenizer,
+// the dictionary work and the JSON construction are skipped.
+class ObTokenizeResultCache
+{
+public:
+  static constexpr int64_t SLOT_CNT = 64;
+  static constexpr int64_t MAX_ARENA_BYTES = 8 * 1024 * 1024;
+  static constexpr int64_t MAX_ENTRY_BYTES = 1024 * 1024;
+
+  struct Entry
+  {
+    uint64_t hash_;
+    int64_t key_len_;
+    int64_t val_len_;
+    char *key_;
+    char *val_;
+  };
+
+public:
+  static ObTokenizeResultCache &get_instance()
+  {
+    static thread_local ObTokenizeResultCache cache;
+    return cache;
+  }
+
+  static uint64_t hash_key(const char *key, const int64_t len)
+  {
+    uint64_t hash = 1469598103934665603ULL;
+    for (int64_t i = 0; i < len; ++i) {
+      hash ^= static_cast<unsigned char>(key[i]);
+      hash *= 1099511628211ULL;
+    }
+    return hash;
+  }
+
+  bool get(const char *key, const int64_t key_len, const uint64_t hash, ObString &value) const
+  {
+    bool found = false;
+    const Entry &entry = slots_[hash % SLOT_CNT];
+    if (nullptr != entry.key_ && entry.hash_ == hash && entry.key_len_ == key_len
+        && 0 == MEMCMP(entry.key_, key, key_len)) {
+      value.assign_ptr(entry.val_, static_cast<int32_t>(entry.val_len_));
+      found = true;
+    }
+    return found;
+  }
+
+  void put(const char *key, const int64_t key_len, const uint64_t hash,
+           const char *value, const int64_t value_len)
+  {
+    if (key_len + value_len > MAX_ENTRY_BYTES || !has_space(key_len + value_len)) {
+      return;
+    }
+    char *key_copy = static_cast<char *>(arena_.alloc(key_len));
+    char *value_copy = static_cast<char *>(arena_.alloc(value_len));
+    if (OB_ISNULL(key_copy) || OB_ISNULL(value_copy)) {
+      return;
+    }
+    MEMCPY(key_copy, key, key_len);
+    MEMCPY(value_copy, value, value_len);
+    Entry &entry = slots_[hash % SLOT_CNT];
+    entry.hash_ = hash;
+    entry.key_len_ = key_len;
+    entry.val_len_ = value_len;
+    entry.key_ = key_copy;
+    entry.val_ = value_copy;
+  }
+
+private:
+  ObTokenizeResultCache() : arena_(ObMemAttr("TokenizeResult"))
+  {
+    MEMSET(slots_, 0, sizeof(slots_));
+  }
+  ~ObTokenizeResultCache() = default;
+
+  bool has_space(const int64_t bytes) const { return arena_.used() + bytes <= MAX_ARENA_BYTES; }
+
+private:
+  ObArenaAllocator arena_;
+  Entry slots_[SLOT_CNT];
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObTokenizeResultCache);
+};
+
 // The dictionary loader handle is keyed by (parser name, charset) and lives in
 // the process global loader map.  Looking it up again on every tokenize() call
 // (write lock + refcount churn) is pure overhead; keep one handle per thread.
@@ -208,19 +298,60 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
   common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
 
-  ObIJsonBase *json_result = nullptr;
   TokenizeParam param;
+  char stack_key[1024];
+  char *key_buf = stack_key;
+  int64_t key_len = 0;
 
   // check param num, which is checked in ObExprOperator::calc_result_typeN.
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
-  } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
-                                                     ctx,
-                                                     temp_allocator,
-                                                     json_result,
-                                                     expr_datum))) {
+  } else if (OB_FALSE_IT(key_len = param.parser_name_.length() + param.properties_.length()
+                                  + param.fulltext_.length() + 2 * sizeof(int32_t) + 2)) {
+  } else if (key_len > static_cast<int64_t>(sizeof(stack_key))
+             && OB_ISNULL(key_buf = static_cast<char *>(temp_allocator.alloc(key_len)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    int64_t pos = 0;
+    if (param.parser_name_.length() > 0) {
+      MEMCPY(key_buf + pos, param.parser_name_.ptr(), param.parser_name_.length());
+      pos += param.parser_name_.length();
+    }
+    key_buf[pos++] = '\0';
+    if (param.properties_.length() > 0) {
+      MEMCPY(key_buf + pos, param.properties_.ptr(), param.properties_.length());
+      pos += param.properties_.length();
+    }
+    key_buf[pos++] = '\0';
+    const int32_t output_mode = static_cast<int32_t>(param.output_mode_);
+    MEMCPY(key_buf + pos, &output_mode, sizeof(output_mode));
+    pos += sizeof(output_mode);
+    const int32_t collation = static_cast<int32_t>(param.meta_.get_collation_type());
+    MEMCPY(key_buf + pos, &collation, sizeof(collation));
+    pos += sizeof(collation);
+    if (param.fulltext_.length() > 0) {
+      MEMCPY(key_buf + pos, param.fulltext_.ptr(), param.fulltext_.length());
+      pos += param.fulltext_.length();
+    }
+    ObTokenizeResultCache &cache = ObTokenizeResultCache::get_instance();
+    const uint64_t key_hash = ObTokenizeResultCache::hash_key(key_buf, key_len);
+    ObString cached_result;
+    if (cache.get(key_buf, key_len, key_hash, cached_result)) {
+      // identical arguments: reuse the packed result of the miss path byte for byte
+      if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, cached_result))) {
+      }
+    } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
+    } else {
+      ObIJsonBase *json_result = nullptr;
+      ObString raw_result;
+      if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+      } else if (OB_FAIL(share::ObJsonWrapper::get_raw_binary(json_result, raw_result, &temp_allocator))) {
+      } else if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, raw_result))) {
+      } else {
+        cache.put(key_buf, key_len, key_hash, raw_result.ptr(), raw_result.length());
+      }
+    }
   }
 
   return ret;
@@ -364,8 +495,8 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
   } else if (OB_FAIL(parse_parser_name(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
   } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
-  } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
   }
+  // the dictionary is only needed when the result cache misses
   return ret;
 }
 

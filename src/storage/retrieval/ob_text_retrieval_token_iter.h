@@ -119,6 +119,29 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalTokenIter);
 };
 
+// Document id of a posting list as an order-preserving integer pair: unsigned integer ids are
+// kept in lo_, 16-byte binary ids (ObDocId) are split into two big-endian halves, so that integer
+// comparison follows the binary order of the inverted index.
+struct ObTextDocIdKey
+{
+  uint64_t hi_;
+  uint64_t lo_;
+  OB_INLINE bool operator<(const ObTextDocIdKey &other) const
+  {
+    return hi_ < other.hi_ || (hi_ == other.hi_ && lo_ < other.lo_);
+  }
+  OB_INLINE bool operator==(const ObTextDocIdKey &other) const
+  {
+    return hi_ == other.hi_ && lo_ == other.lo_;
+  }
+  static const int64_t BINARY_ID_LEN = 2 * sizeof(uint64_t);
+  static bool is_supported(const ObDatumMeta &meta)
+  {
+    return common::ObUInt64Type == meta.type_
+        || (common::ObVarcharType == meta.type_ && common::CS_TYPE_BINARY == meta.cs_type_);
+  }
+};
+
 class ObTextRetrievalDaaTTokenIter final : public ObISRDaaTDimIter
 {
 public:
@@ -132,6 +155,9 @@ public:
   virtual int advance_to(const ObDatum &id_datum) override;
   virtual int get_curr_score(double &score) const override;
   virtual int get_curr_id(const ObDatum *&id_datum) const override;
+  // Loads the next batch of document ids as order-preserving keys, for document-at-a-time unions
+  // that need no relevance. Does not touch the row-wise cursor of get_next_row().
+  int get_next_id_key_batch(const ObTextDocIdKey *&keys, int64_t &count);
 public:
   int get_token_doc_cnt(int64_t &token_doc_cnt) const { return token_iter_->get_token_doc_cnt(token_doc_cnt); }
   virtual int get_dim_max_score(double &score) override {
@@ -155,6 +181,7 @@ private:
   int64_t count_;
   ObFixedArray<double, ObIAllocator> relevance_; // when ~ObFixedArray(), wikll destory itself
   ObFixedArray<ObDocIdExt, ObIAllocator> doc_id_;
+  ObTextDocIdKey *id_keys_;
   common::ObDatumCmpFuncType cmp_func_;
   bool is_inited_;
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalDaaTTokenIter);

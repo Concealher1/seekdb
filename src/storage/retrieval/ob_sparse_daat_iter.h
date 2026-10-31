@@ -57,6 +57,8 @@ private:
   // TODO: if memory lifetime of docid datum is guaranteed by dim_iters, we can use pointer to datum directly
   //       and avoid deep copy into merge heap here
   const ObFixedArray<const ObDatum *, ObIAllocator> *iter_ids_;
+  bool binary_ids_;
+  bool unsigned_ids_;
   bool is_inited_;
 };
 

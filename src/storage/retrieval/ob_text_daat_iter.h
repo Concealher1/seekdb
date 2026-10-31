@@ -37,7 +37,7 @@ struct ObTextDaaTParam
   ObTextDaaTParam()
     : dim_iters_(nullptr), base_param_(nullptr), allocator_(nullptr), relevance_collector_(nullptr),
       bm25_param_est_ctx_(), mode_flag_(sql::ObMatchAgainstMode::NATURAL_LANGUAGE_MODE),
-      function_lookup_mode_(false) {}
+      function_lookup_mode_(false), min_should_match_(0) {}
   ~ObTextDaaTParam() {}
   TO_STRING_KV(K_(base_param), KP_(dim_iters), K_(bm25_param_est_ctx),  K_(mode_flag), K_(function_lookup_mode));
   ObIArray<ObISRDaaTDimIter *> *dim_iters_;
@@ -47,6 +47,7 @@ struct ObTextDaaTParam
   ObBM25ParamEstCtx bm25_param_est_ctx_;
   sql::ObMatchAgainstMode mode_flag_;
   bool function_lookup_mode_;
+  int64_t min_should_match_;
 };
 
 class ObTextDaaTIter final : public ObSRDaaTIterImpl
@@ -55,19 +56,46 @@ public:
   ObTextDaaTIter() : ObSRDaaTIterImpl(),
       bm25_param_estimator_(),
       mode_flag_(sql::ObMatchAgainstMode::NATURAL_LANGUAGE_MODE),
-      function_lookup_mode_(false) {}
+      function_lookup_mode_(false),
+      min_should_match_(0),
+      union_mode_checked_(false),
+      union_mode_(false),
+      union_cursors_(nullptr),
+      union_out_ids_(nullptr),
+      union_out_bytes_(nullptr) {}
   virtual ~ObTextDaaTIter() { reset(); }
 
   int init(const ObTextDaaTParam &param);
+  virtual int get_next_rows(const int64_t capacity, int64_t &count) override;
   virtual void reuse(const bool switch_tablet = false) override;
   virtual void reset() override;
 protected:
   virtual int pre_process() override;
+private:
+  // When neither relevance nor a filter on it is needed and document ids are unsigned integers,
+  // the result is the plain union of the sorted posting lists, merged on raw ids.
+  struct UnionCursor
+  {
+    const ObTextDocIdKey *keys_;
+    int64_t count_;
+    int64_t pos_;
+    bool end_;
+  };
+  int check_union_mode();
+  int union_next_rows(const int64_t capacity, int64_t &count);
+  int load_union_cursor(UnionCursor &cursor, const int64_t dim_idx);
+  void reset_union_cursors();
 protected:
   ObBM25ParamEstimator bm25_param_estimator_;
   sql::ObMatchAgainstMode mode_flag_;
   bool function_lookup_mode_;
+  int64_t min_should_match_;
 private:
+  bool union_mode_checked_;
+  bool union_mode_;
+  UnionCursor *union_cursors_;
+  ObTextDocIdKey *union_out_ids_;
+  char *union_out_bytes_;
   DISALLOW_COPY_AND_ASSIGN(ObTextDaaTIter);
 };
 

@@ -375,7 +375,14 @@ private:
   int check_exec_param_correlated(const ObRawExpr *expr, bool &is_correlated);
   int check_is_correlated_cte(ObSelectStmt *stmt, ObIArray<ObSelectStmt *> &visited_cte, bool &is_correlated);
   int convert_join_preds_vector_to_scalar(JoinedTable &joined_table, bool &trans_happened);
-  int preserve_order_for_fulltext_search(ObDMLStmt *stmt, bool& trans_happened);
+  int preserve_order_for_fulltext_search(const common::ObIArray<ObParentDMLStmt> &parent_stmts,
+                                         ObDMLStmt *stmt,
+                                         bool& trans_happened);
+  // the parent of a view only counts its rows: neither the row order nor the projected values
+  // of the view are observable
+  int check_view_rows_only_counted(const common::ObIArray<ObParentDMLStmt> &parent_stmts,
+                                   const ObDMLStmt *stmt,
+                                   bool &only_counted);
 
   int flatten_conditions(ObDMLStmt *stmt, bool &trans_happened);
   int recursive_flatten_join_conditions(ObDMLStmt *stmt, TableItem *table, bool &trans_happened);

@@ -179,7 +179,7 @@ int ObTransformPreProcess::transform_one_stmt(common::ObIArray<ObParentDMLStmt> 
     }
     if (OB_SUCC(ret)) {
       if (stmt->get_match_exprs().count() > 0 &&
-          OB_FAIL(preserve_order_for_fulltext_search(stmt, is_happened))) {
+          OB_FAIL(preserve_order_for_fulltext_search(parent_stmts, stmt, is_happened))) {
       } else {
         trans_happened |= is_happened;
       }
@@ -3790,14 +3790,77 @@ int ObTransformPreProcess::do_flatten_conditions(ObDMLStmt *stmt, ObIArray<ObRaw
 
 // full-text index queries on a single base table are processed with order preservation. 
 // (Order is not preserved in multi-table join scenarios.)
-int ObTransformPreProcess::preserve_order_for_fulltext_search(ObDMLStmt *stmt, bool& trans_happened)
+int ObTransformPreProcess::check_view_rows_only_counted(const ObIArray<ObParentDMLStmt> &parent_stmts,
+                                                       const ObDMLStmt *stmt,
+                                                       bool &only_counted)
+{
+  int ret = OB_SUCCESS;
+  only_counted = false;
+  const ObDMLStmt *parent = parent_stmts.empty() ? nullptr : parent_stmts.at(parent_stmts.count() - 1).stmt_;
+  if (OB_ISNULL(stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(parent) || !parent->is_select_stmt() || !stmt->is_select_stmt()) {
+    // do nothing
+  } else {
+    const ObSelectStmt *parent_sel = static_cast<const ObSelectStmt *>(parent);
+    const ObSelectStmt *view = static_cast<const ObSelectStmt *>(stmt);
+    const TableItem *view_item = parent_sel->get_table_size() == 1 ? parent_sel->get_table_item(0) : nullptr;
+    only_counted = nullptr != view_item
+        && view_item->is_generated_table()
+        && view_item->ref_query_ == stmt
+        && 1 == parent_sel->get_from_item_size()
+        && 0 == parent_sel->get_column_size(view_item->table_id_)
+        && parent_sel->get_condition_exprs().empty()
+        && parent_sel->get_semi_info_size() == 0
+        && 0 == parent_sel->get_group_expr_size()
+        && !parent_sel->has_rollup()
+        && !parent_sel->has_having()
+        && !parent_sel->has_window_function()
+        && !view->is_set_stmt()
+        && !view->has_distinct()
+        && !view->has_group_by()
+        && !view->has_having()
+        && !view->has_window_function()
+        && 0 == view->get_aggr_item_size()
+        && !view->is_calc_found_rows()
+        && !view->is_fetch_with_ties()
+        && nullptr == view->get_limit_percent_expr();
+  }
+  return ret;
+}
+
+int ObTransformPreProcess::preserve_order_for_fulltext_search(const ObIArray<ObParentDMLStmt> &parent_stmts,
+                                                             ObDMLStmt *stmt,
+                                                             bool& trans_happened)
 {
   int ret = OB_SUCCESS;
   trans_happened = false;
   TableItem *table_item = NULL;
   ObRawExpr *match_expr = nullptr;
+  bool only_counted = false;
   if (OB_ISNULL(stmt)) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(check_view_rows_only_counted(parent_stmts, stmt, only_counted))) {
+  } else if (only_counted) {
+    // e.g. SELECT COUNT(*) FROM (SELECT id FROM t WHERE MATCH(...) AGAINST(...) LIMIT n) v:
+    // keep the retrieval unordered, and project a constant instead of plain columns so that
+    // the documents need no lookup into the data table.
+    ObSelectStmt *view = static_cast<ObSelectStmt *>(stmt);
+    for (int64_t i = 0; OB_SUCC(ret) && i < view->get_select_item_size(); ++i) {
+      SelectItem &item = view->get_select_item(i);
+      ObConstRawExpr *one_expr = nullptr;
+      if (OB_ISNULL(item.expr_)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (!item.expr_->is_column_ref_expr()) {
+        // keep it
+      } else if (OB_ISNULL(ctx_) || OB_ISNULL(ctx_->expr_factory_)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(*ctx_->expr_factory_, ObIntType, 1, one_expr))) {
+      } else {
+        item.expr_ = one_expr;
+        trans_happened = true;
+      }
+    }
   } else if (stmt->get_table_items().count() != 1 || stmt->get_order_item_size() != 0) {
     // do nothing
   } else if (stmt->is_select_stmt() && 

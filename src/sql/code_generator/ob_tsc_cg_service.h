@@ -344,6 +344,7 @@ private:
                                        ObDASBaseCtDef *&root_ctdef,
                                        const bool is_vec_pre_filter = false,
                                        const bool is_vec_iter_filter = false);
+  int check_relevance_projection(ObDASBaseCtDef *scan_ctdef, bool &has_relevance_proj);
   int check_lookup_iter_type(ObDASBaseCtDef *scan_ctdef, bool &need_proj_relevance_score);
   int generate_match_ctdef(const ObLogTableScan &op,
                                  ObTableScanCtDef &tsc_ctdef,
