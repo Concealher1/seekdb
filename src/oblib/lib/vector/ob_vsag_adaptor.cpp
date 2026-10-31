@@ -87,6 +87,10 @@ struct ObCuvsEntry {
   std::vector<int64_t> buf_ids_;// accumulated external vids from add_index
   size_t built_n_ = 0;          // #vectors present when cuVS was last (re)built
   bool vsag_ready_ = false;     // CPU fallback is built only when it is needed
+  // Diagnostic only: wall clock of the first buffered row, so the DDL log can
+  // split "scan + append" from "GPU build" and "snapshot write" inside the
+  // timed CREATE VECTOR INDEX window.
+  int64_t first_add_us_ = 0;
 };
 static std::mutex g_ob_cuvs_mu;
 static std::map<void *, ObCuvsEntry *> g_ob_cuvs_reg;
@@ -175,6 +179,7 @@ static void ob_cuvs_add(void *key, const float *vectors, const int64_t *ids,
   ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
   if (slot == nullptr) { slot = new ObCuvsEntry(); slot->dim_ = dim; }
   if (slot->dim_ == 0) { slot->dim_ = dim; }
+  if (slot->first_add_us_ == 0) { slot->first_add_us_ = ObTimeUtility::current_time(); }
   if (slot->dim_ != dim) { return; }
   slot->buf_vecs_.insert(slot->buf_vecs_.end(), vectors,
                          vectors + static_cast<size_t>(dim) * size);
@@ -440,8 +445,10 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     remaining -= bytes;
   }
   const int64_t total_us = ObTimeUtility::current_time() - start_us;
+  const int64_t append_us = ent->first_add_us_ > 0 && ent->first_add_us_ <= start_us
+      ? start_us - ent->first_add_us_ : 0;
   LOG_INFO("[OBVSAG][cuVS] serialized GPU CAGRA snapshot", KP(key), K(n), K(dim32),
-           K(built), K(build_us), K(total_us), K(graph_bytes));
+           K(built), K(append_us), K(build_us), K(total_us), K(graph_bytes));
   return true;
 }
 
