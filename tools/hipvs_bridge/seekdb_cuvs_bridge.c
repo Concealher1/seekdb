@@ -46,7 +46,7 @@ static int sk_cuvs_ensure_search_scratch(sk_cuvs_index* h, long nq, long topk)
     size_t required_itopk = (size_t)topk * 4;
     if (required_itopk < 512) { required_itopk = 512; }
     if (h->sp->itopk_size < required_itopk) { h->sp->itopk_size = required_itopk; }
-    h->sp->search_width = 4;
+    h->sp->search_width = 8;
   }
   if (need_q > h->q_cap) {
     const size_t cap = need_q * 2;
@@ -89,9 +89,9 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
 
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
   h->ip->build_algo = NN_DESCENT;
-  h->ip->graph_degree = 128;
-  h->ip->intermediate_graph_degree = 192;
-  h->ip->nn_descent_niter = 40;
+  h->ip->graph_degree = 144;
+  h->ip->intermediate_graph_degree = 128;
+  h->ip->nn_descent_niter = 32;
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
   h->n = n; h->dim = dim;
