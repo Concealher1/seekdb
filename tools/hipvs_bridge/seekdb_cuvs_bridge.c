@@ -46,7 +46,7 @@ static int sk_cuvs_ensure_search_scratch(sk_cuvs_index* h, long nq, long topk)
     size_t required_itopk = (size_t)topk * 4;
     if (required_itopk < 512) { required_itopk = 512; }
     if (h->sp->itopk_size < required_itopk) { h->sp->itopk_size = required_itopk; }
-    h->sp->search_width = 4;
+    h->sp->search_width = (h->dim <= 128) ? 32 : 20;
   }
   if (need_q > h->q_cap) {
     const size_t cap = need_q * 2;
@@ -89,9 +89,13 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
 
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
   h->ip->build_algo = NN_DESCENT;
-  h->ip->graph_degree = 128;
-  h->ip->intermediate_graph_degree = 192;
-  h->ip->nn_descent_niter = 40;
+  /* Dimension-split budget: the 256d dataset needs a richer graph to hit its
+   * recall band, while 128d keeps the baseline graph and spends the saved build
+   * time on a much wider search instead. */
+  const bool low_dim = (dim <= 128);
+  h->ip->graph_degree = low_dim ? 128 : 160;
+  h->ip->intermediate_graph_degree = low_dim ? 128 : 160;
+  h->ip->nn_descent_niter = low_dim ? 24 : 20;
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
   h->n = n; h->dim = dim;
