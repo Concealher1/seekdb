@@ -889,6 +889,129 @@ int ObHNSWIndexAppendBufferOperator::init(
     vector_key_col_idx_ = vector_index_ctx->vector_key_col_idx_;
     vector_data_col_idx_ = vector_index_ctx->vector_data_col_idx_;
     if (OB_FAIL(extra_column_idx_types_.assign(vector_index_ctx->extra_column_idx_types_))) {
+    } else {
+      // [BATCH] Only indexes without extra-info columns are batched: with extra
+      // columns the per-row ObVecExtraInfoObj objects point into row_allocator_,
+      // which is reused for every row, so those rows are handed over one at a
+      // time exactly as before.
+      batch_enabled_ = (0 == extra_column_idx_types_.count());
+      batch_cnt_ = 0;
+      batch_bytes_ = 0;
+    }
+  }
+  return ret;
+}
+
+// [BATCH] Lazily allocate the row batch. The payload buffer holds at least two
+// dense rows (and about 2MB for the usual 128/256-dim tables), so a dense table
+// never hits the grow path; the row-indexed arrays are fixed at 4096 rows.
+int ObHNSWIndexAppendBufferOperator::ensure_batch_buffer()
+{
+  int ret = OB_SUCCESS;
+  if (nullptr != batch_buf_ && nullptr != batch_vids_ && nullptr != batch_lens_
+      && batch_cap_rows_ > 0) {
+    // already allocated for this tablet
+  } else if (OB_UNLIKELY(vec_dim_ <= 0)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid vector dim for append batch", K(ret), K_(vec_dim));
+  } else {
+    const int64_t rows = 4096;
+    int64_t bytes = 2LL * 1024LL * 1024LL;
+    const int64_t dense_row_bytes = vec_dim_ * static_cast<int64_t>(sizeof(float));
+    if (bytes < 2 * dense_row_bytes) {
+      bytes = 2 * dense_row_bytes;
+    }
+    if (OB_ISNULL(batch_buf_ = static_cast<char *>(op_allocator_.alloc(bytes)))
+        || OB_ISNULL(batch_vids_ = static_cast<int64_t *>(op_allocator_.alloc(rows * sizeof(int64_t))))
+        || OB_ISNULL(batch_lens_ = static_cast<uint32_t *>(op_allocator_.alloc(rows * sizeof(uint32_t))))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      batch_buf_ = nullptr;
+      batch_vids_ = nullptr;
+      batch_lens_ = nullptr;
+      LOG_WARN("failed to allocate append batch buffers", K(ret), K(bytes), K(rows), K_(vec_dim));
+    } else {
+      batch_buf_cap_ = bytes;
+      batch_bytes_ = 0;
+      batch_cnt_ = 0;
+      batch_cap_rows_ = rows;
+    }
+  }
+  return ret;
+}
+
+// [BATCH] Buffer one row's payload (dense vector bytes or sparse blob bytes)
+// and its vid/length; flush first when the batch is full.
+int ObHNSWIndexAppendBufferOperator::buffer_batch_row(
+    int64_t vec_vid, const ObString &vec_str, ObDDLTabletContext *tablet_context)
+{
+  int ret = OB_SUCCESS;
+  const int64_t len = vec_str.length();
+  if (OB_FAIL(ensure_batch_buffer())) {
+  } else if (OB_UNLIKELY(len <= 0)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid vector payload length for append batch", K(ret), K(len));
+  } else {
+    if (batch_cnt_ > 0
+        && (batch_cnt_ >= batch_cap_rows_ || batch_bytes_ + len > batch_buf_cap_)) {
+      // Batch is full: hand it over before buffering this row.
+      if (OB_FAIL(flush_batch(tablet_context))) {
+      }
+    }
+    if (OB_SUCC(ret) && len > batch_buf_cap_) {
+      // A single payload larger than the whole batch buffer (only reachable for
+      // an outsized sparse blob; the batch is empty here): grow the buffer, it
+      // is reused for every later batch.
+      char *buf = static_cast<char *>(op_allocator_.alloc(len));
+      if (OB_ISNULL(buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to grow append batch buffer", K(ret), K(len));
+      } else {
+        batch_buf_ = buf;
+        batch_buf_cap_ = len;
+        batch_bytes_ = 0;
+        batch_cnt_ = 0;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      MEMCPY(batch_buf_ + batch_bytes_, vec_str.ptr(), len);
+      batch_vids_[batch_cnt_] = vec_vid;
+      batch_lens_[batch_cnt_] = static_cast<uint32_t>(len);
+      batch_bytes_ += len;
+      ++batch_cnt_;
+    }
+  }
+  return ret;
+}
+
+// [BATCH] Hand the whole batch to the adaptor in one call. The batch is always
+// cleared, so a failed flush can never re-add rows on a later path.
+int ObHNSWIndexAppendBufferOperator::flush_batch(ObDDLTabletContext *tablet_context)
+{
+  int ret = OB_SUCCESS;
+  if (0 == batch_cnt_) {
+    // nothing buffered
+  } else if (OB_ISNULL(tablet_context) || OB_ISNULL(tablet_context->vector_index_ctx_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid tablet context for append batch", K(ret), K_(batch_cnt));
+  } else {
+    ObIVectorIndexRuntime *vec_index_service = ::oceanbase::share::server_service<::oceanbase::storage::ObIVectorIndexRuntime>();
+    ObPluginVectorIndexAdapterGuard adaptor_guard;
+    ObPluginVectorIndexAdaptor *adaptor = nullptr;
+    const int64_t batch_cnt = batch_cnt_;
+    batch_cnt_ = 0;
+    batch_bytes_ = 0;
+    if (OB_ISNULL(vec_index_service)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("error unexpected, vector index service is nullptr", K(ret));
+    } else if (OB_FAIL(vec_index_service->acquire_adapter_guard(tablet_id_,
+                   ObIndexType::INDEX_TYPE_VEC_INDEX_SNAPSHOT_DATA_LOCAL, adaptor_guard,
+                   &tablet_context->vector_index_ctx_->vec_idx_param_,
+                   tablet_context->vector_index_ctx_->vec_dim_))) {
+    } else if (OB_ISNULL(adaptor = adaptor_guard.get_adatper())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("error unexpected, snapshot adaptor is nullptr", K(ret), K(batch_cnt));
+    } else if (OB_FAIL(adaptor->add_snap_index(reinterpret_cast<float *>(batch_buf_), batch_vids_,
+                                               nullptr, 0, static_cast<int>(batch_cnt), batch_lens_))) {
     }
   }
   return ret;
@@ -918,6 +1041,10 @@ int ObHNSWIndexAppendBufferOperator::append_row(
                  row_allocator_, ObLongTextType, CS_TYPE_BINARY, true, vec_str))) {
   } else if (vec_str.length() == 0) {
     // do nothing
+  } else if (batch_enabled_) {
+    // [BATCH] Queue the row payload for the next single add_snap_index() call.
+    if (OB_FAIL(buffer_batch_row(vec_vid, vec_str, tablet_context))) {
+    }
   } else {
     ObIVectorIndexRuntime *vec_index_service = ::oceanbase::share::server_service<::oceanbase::storage::ObIVectorIndexRuntime>();
     ObPluginVectorIndexAdapterGuard adaptor_guard;
@@ -998,7 +1125,15 @@ int ObHNSWIndexAppendBufferOperator::execute(
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
   } else if (input_chunk.is_end_chunk()) {
-    // do nothing
+    // Every data chunk flushes its batch before returning, so this is a no-op in
+    // the normal flow; flush defensively if a row is ever still pending here so
+    // that not a single row of the index can be lost.
+    if (batch_cnt_ > 0) {
+      ObDDLTabletContext *tablet_context = nullptr;
+      if (OB_FAIL(get_ddl_tablet_context(tablet_context))) {
+      } else if (OB_FAIL(flush_batch(tablet_context))) {
+      }
+    }
   } else {
     ObDDLIndependentDag *dag = nullptr;
     ObDDLTabletContext *tablet_context = nullptr;
@@ -1024,6 +1159,10 @@ int ObHNSWIndexAppendBufferOperator::execute(
             ob_free(row_file);
             row_file = nullptr;
           }
+        }
+        // [BATCH] Hand over everything buffered for this chunk before returning,
+        // so no row is ever left pending when the pipeline moves on.
+        if (OB_SUCC(ret) && OB_FAIL(flush_batch(tablet_context))) {
         }
       }
     }

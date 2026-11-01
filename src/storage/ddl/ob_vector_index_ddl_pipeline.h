@@ -272,12 +272,25 @@ class ObHNSWIndexAppendBufferOperator : public ObVectorIndexBaseOperator
 {
 public:
   explicit ObHNSWIndexAppendBufferOperator(ObPipeline *pipeline)
-    : ObVectorIndexBaseOperator(pipeline)
+    : ObVectorIndexBaseOperator(pipeline),
+      vec_dim_(0),
+      vector_vid_col_idx_(-1),
+      vector_col_idx_(-1),
+      vector_key_col_idx_(-1),
+      vector_data_col_idx_(-1),
+      batch_buf_(nullptr),
+      batch_buf_cap_(0),
+      batch_bytes_(0),
+      batch_vids_(nullptr),
+      batch_lens_(nullptr),
+      batch_cnt_(0),
+      batch_cap_rows_(0),
+      batch_enabled_(false)
   {}
   virtual int init(
       const ObTabletID &tablet_id);
   TO_STRING_KV(K_(vec_dim), K_(vec_idx_param), K_(vector_vid_col_idx), K_(vector_col_idx),
-      K_(vector_key_col_idx), K_(vector_data_col_idx), K_(extra_column_idx_types));
+      K_(vector_key_col_idx), K_(vector_data_col_idx), K_(extra_column_idx_types), K_(batch_cnt));
 protected:
   virtual int execute(
       const ObChunk &input_chunk,
@@ -299,6 +312,20 @@ private:
       const common::ObIArray<common::ObIVector *> &vectors,
       ObDDLTabletContext *tablet_context);
   int append_row_file(ObDDLRowFile *row_file, ObDDLTabletContext *tablet_context);
+  // [BATCH] Hand a whole run of buffered rows to ONE add_snap_index() call
+  // instead of one call per row. The payload is not changed in any way: the
+  // batch holds, in the same relative order, the very same per-row byte ranges
+  // (dense float vectors or sparse blobs) and the same external vids that the
+  // per-row path would have passed one at a time, and the per-row byte lengths
+  // are still handed to add_snap_index(). So the rows the adaptor accumulates,
+  // the CAGRA build input, the graph and the search results are identical; only
+  // the per-call overhead (adaptor guard lookup, adaptor mutexes, cuVS registry
+  // mutexes, two std::vector::insert calls, mark_cuvs_index) is paid once per
+  // batch instead of once per row.
+  int ensure_batch_buffer();
+  int buffer_batch_row(int64_t vec_vid, const common::ObString &vec_str,
+                       ObDDLTabletContext *tablet_context);
+  int flush_batch(ObDDLTabletContext *tablet_context);
 private:
   int64_t vec_dim_;
   common::ObString vec_idx_param_;
@@ -307,6 +334,17 @@ private:
   int32_t vector_key_col_idx_;
   int32_t vector_data_col_idx_;
   ObSEArray<share::ObExtraInfoIdxType, 4> extra_column_idx_types_;
+  // [BATCH] Pending rows. batch_buf_ holds the concatenation of the batch_cnt_
+  // row payloads (batch_lens_[i] bytes each), batch_vids_ the external vids.
+  // All three are allocated from op_allocator_ and reused across batches.
+  char *batch_buf_;
+  int64_t batch_buf_cap_;
+  int64_t batch_bytes_;
+  int64_t *batch_vids_;
+  uint32_t *batch_lens_;
+  int64_t batch_cnt_;
+  int64_t batch_cap_rows_;
+  bool batch_enabled_;  // false when the index carries extra-info columns
 };
 
 class ObHNSWIndexBuildOperator : public ObVectorIndexBaseOperator
