@@ -197,9 +197,13 @@ public:
 
   int serialize(void *index, ObOStreamBuf::CbParam &cb_param, ObOStreamBuf::Callback &cb, const int64_t capacity = DEFAULT_OUTBUF_CAPACITY);
   int deserialize(void *&index, ObIStreamBuf::CbParam &cb_param, ObIStreamBuf::Callback &cb);
-private:
   static const int64_t DEFAULT_OUTBUF_CAPACITY = 2LL * 1024LL * 1024LL; // 2MB
-
+  // A cuVS CAGRA snapshot is one long sequential stream (graph blob relayed from
+  // a temp file, then the buffered ids and vectors), so it is written with a
+  // bigger stream buffer: same bytes in the same order, but ~4x fewer and larger
+  // LOB rows in the snapshot data tablet, i.e. fewer lob appends / locators /
+  // rows to write and to read back on load.
+  static const int64_t CUVS_SNAPSHOT_OUTBUF_CAPACITY = 8LL * 1024LL * 1024LL; // 8MB
 private:
   bool is_inited_;
   ObIAllocator &allocator_;

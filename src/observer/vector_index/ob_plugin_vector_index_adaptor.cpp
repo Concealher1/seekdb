@@ -3290,6 +3290,19 @@ int ObPluginVectorIndexAdaptor::serialize(ObIAllocator *allocator, ObOStreamBuf:
   int ret = OB_SUCCESS;
   ObVectorIndexSerializer index_seri(*allocator);
   int64_t snap_index_size = 0;
+  // Same predicate as renew_single_snap_index()'s keep_gpu_snapshot: the index is
+  // served by the GPU CAGRA backend, whose snapshot is one long sequential
+  // stream. Only the stream buffer size changes (the bytes and the resulting
+  // snapshot format stay identical), so a non-cuVS index is untouched.
+  const ObVectorIndexParam *param = static_cast<const ObVectorIndexParam *>(algo_data_);
+  const bool is_cuvs_snapshot = param != nullptr
+      && param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS
+      && param->dist_algorithm_ == ObVectorIndexDistAlgorithm::VIDA_L2
+      && (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW
+          || param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH);
+  const int64_t stream_capacity = is_cuvs_snapshot
+      ? ObVectorIndexSerializer::CUVS_SNAPSHOT_OUTBUF_CAPACITY
+      : ObVectorIndexSerializer::DEFAULT_OUTBUF_CAPACITY;
   if (!snap_data_->is_inited()) {
     ret = OB_NOT_INIT;
     LOG_WARN("snap index is not init", K(ret));
@@ -3297,7 +3310,7 @@ int ObPluginVectorIndexAdaptor::serialize(ObIAllocator *allocator, ObOStreamBuf:
   } else if (snap_index_size == 0) {
     // do nothing
     LOG_INFO("[vec index] empty snap index, do not need to serialize");
-  } else if (OB_FAIL(index_seri.serialize(snap_data_->index_, cb_param, cb))) {
+  } else if (OB_FAIL(index_seri.serialize(snap_data_->index_, cb_param, cb, stream_capacity))) {
   } else {
     // for multi-version snapshot
     // rb_flag is true means need check snapshot next query.
