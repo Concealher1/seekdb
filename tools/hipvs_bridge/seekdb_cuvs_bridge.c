@@ -89,9 +89,12 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
 
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
   h->ip->build_algo = NN_DESCENT;
-  h->ip->graph_degree = 128;
-  h->ip->intermediate_graph_degree = 192;
-  h->ip->nn_descent_niter = 40;
+  /* intermediate_graph_degree drives the pruning cost quadratically, so it is
+   * the cheapest place to buy build time; graph_degree only shapes the final
+   * pruning and barely costs anything during construction. */
+  h->ip->graph_degree = 144;
+  h->ip->intermediate_graph_degree = 144;
+  h->ip->nn_descent_niter = 32;
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
   h->n = n; h->dim = dim;
