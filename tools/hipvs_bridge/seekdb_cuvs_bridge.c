@@ -88,7 +88,7 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   dset.dl_tensor.shape = ds; dset.dl_tensor.strides = 0; dset.dl_tensor.byte_offset = 0;
 
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
-  h->ip->build_algo = NN_DESCENT;
+  h->ip->build_algo = IVF_PQ;
   h->ip->graph_degree = 128;
   h->ip->intermediate_graph_degree = 192;
   h->ip->nn_descent_niter = 40;
